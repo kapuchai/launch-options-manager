@@ -8,14 +8,21 @@ launch-options text field with a real manager:
   **on/off toggle**: switch `mangohud` or `PROTON_LOG=1` off without deleting it. Disabled
   entries are remembered by the plugin, not written to Steam.
 - **Preset catalog** — ~65 curated Linux/Proton options (gamemoderun, gamescope variants,
-  MangoHud, `PROTON_*`, DXVK/VKD3D/Mesa/NVIDIA env vars, common game flags) with descriptions,
-  added with one click.
+  MangoHud, `PROTON_*`, DXVK/VKD3D/Mesa/NVIDIA env vars, common game flags) in collapsible
+  categories. Already-added presets are marked; presets that can't work on the system or
+  game are flagged (missing binary, Proton-only option on a native Linux game, wrong GPU
+  vendor).
 - **Profiles** — save the current argument set under a name, load it onto any game
-  (replace or merge), and **bulk-apply** a profile to many games at once.
+  (replace or merge), and **bulk-apply** a profile to many games at once (with all-games /
+  installed / per-collection selection). A starter "Default" profile is created on first run.
 - **Instant apply** — changes go through `SteamClient.Apps.SetAppLaunchOptions`, so they're
   live immediately; no Steam restart, no fighting `localconfig.vdf`.
 - `%command%` is inserted/dropped automatically: env vars and wrappers imply it, plain game
   flags don't need it.
+- **Theme-aware** — adapts to the active Millennium theme (reads SpaceTheme-style `--st-*`
+  and Millennium `--SystemAccentColor*` CSS variables, falls back to a Steam-like dark look).
+- Entry points are configurable in the plugin's Millennium settings panel (game-page ⚡
+  button, Properties-dialog link).
 
 Options that use shell constructs the structured editor can't represent
 (pipes, `;`, quoting around `%command%`, …) are detected and edited as a single raw block instead.

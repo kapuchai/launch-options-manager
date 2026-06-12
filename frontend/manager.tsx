@@ -1,25 +1,46 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { DialogButton } from '@steambrew/client';
-import { ArgItem, ArgKind, composeLaunchOptions, makeItem, parseLaunchOptions } from './model';
+import { ArgItem, ArgKind, composeLaunchOptions, makeItem, tokenize } from './model';
 import { PRESETS, Preset } from './presets';
 import {
+    Capabilities,
     GameEntry,
     flushStore,
     getAllGames,
+    getCapabilities,
     getGameItems,
     getGameName,
     getProfiles,
+    getUISettings,
+    getUserCollections,
     deleteProfile,
     isShortcut,
+    onSaveFailure,
+    persistenceBlocked,
     saveProfile,
     setAndVerifyLaunchOptions,
     setGameItems,
     setLaunchOptions,
+    updateUISettings,
 } from './store';
 
-// ── styles ──────────────────────────────────────────────────────────────────
+// ── theme ───────────────────────────────────────────────────────────────────
 
-const C = {
+interface Palette {
+    bg: string;
+    panel: string;
+    panelHover: string;
+    border: string;
+    text: string;
+    muted: string;
+    accent: string;
+    green: string;
+    red: string;
+    yellow: string;
+    mono: string;
+}
+
+const FALLBACK: Palette = {
     bg: '#171d25',
     panel: '#1f2630',
     panelHover: '#252d39',
@@ -29,59 +50,110 @@ const C = {
     accent: '#1a9fff',
     green: '#5ba32b',
     red: '#d94126',
+    yellow: '#e8a33d',
     mono: '"DejaVu Sans Mono", Consolas, monospace',
 };
 
-const S: Record<string, React.CSSProperties> = {
-    root: {
-        display: 'flex', flexDirection: 'column', height: '100%', minHeight: '560px',
-        background: C.bg, color: C.text, fontSize: '13px',
-    },
-    tabBar: { display: 'flex', gap: '2px', padding: '8px 12px 0 12px', borderBottom: `1px solid ${C.border}`, flexShrink: 0 },
-    tab: { padding: '7px 14px', cursor: 'pointer', borderRadius: '3px 3px 0 0', color: C.muted, userSelect: 'none' },
-    tabActive: { background: C.panel, color: C.text, boxShadow: `inset 0 2px 0 ${C.accent}` },
-    body: { flex: 1, overflowY: 'auto', padding: '12px 16px' },
-    section: { marginBottom: '16px' },
-    sectionTitle: { fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.08em', color: C.muted, margin: '0 0 6px 2px' },
-    row: {
-        display: 'flex', alignItems: 'center', gap: '8px', padding: '5px 8px',
-        background: C.panel, borderRadius: '3px', marginBottom: '4px', border: `1px solid ${C.border}`,
-    },
-    rowDisabled: { opacity: 0.55 },
-    input: {
-        flex: 1, background: '#10141a', color: C.text, border: `1px solid ${C.border}`,
-        borderRadius: '2px', padding: '5px 8px', fontFamily: C.mono, fontSize: '12px', outline: 'none', minWidth: 0,
-    },
-    iconBtn: {
-        background: 'transparent', color: C.muted, border: 'none', cursor: 'pointer',
-        padding: '2px 5px', fontSize: '13px', lineHeight: 1, borderRadius: '2px',
-    },
-    addBtn: {
-        background: 'transparent', color: C.accent, border: `1px dashed ${C.border}`, cursor: 'pointer',
-        padding: '5px 10px', borderRadius: '3px', fontSize: '12px', width: '100%', textAlign: 'left',
-    },
-    preview: {
-        flexShrink: 0, borderTop: `1px solid ${C.border}`, padding: '10px 16px',
-        display: 'flex', flexDirection: 'column', gap: '6px', background: '#12161c',
-    },
-    previewText: {
-        fontFamily: C.mono, fontSize: '12px', color: '#9fd3ff', wordBreak: 'break-all',
-        whiteSpace: 'pre-wrap', minHeight: '16px', userSelect: 'text',
-    },
-    toggle: { cursor: 'pointer', width: '30px', height: '16px', borderRadius: '8px', position: 'relative', flexShrink: 0, transition: 'background 0.15s' },
-    knob: { position: 'absolute', top: '2px', width: '12px', height: '12px', borderRadius: '50%', background: '#fff', transition: 'left 0.15s' },
-    smallBtn: {
-        background: C.panel, color: C.text, border: `1px solid ${C.border}`, cursor: 'pointer',
-        padding: '4px 10px', borderRadius: '2px', fontSize: '12px',
-    },
-};
+// Adapt to the active Millennium theme: SpaceTheme (and themes following its
+// convention) define --st-* RGB-triplet variables; Millennium itself injects
+// --SystemAccentColor*. Anything missing falls back to a Steam-like dark look.
+function readPalette(doc: Document): Palette {
+    try {
+        const root = getComputedStyle(doc.documentElement);
+        const triplet = (name: string): string | null => {
+            const v = root.getPropertyValue(name).trim();
+            return /^\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}$/.test(v) ? v : null;
+        };
+        const rgb = (name: string, fallback: string) => {
+            const t = triplet(name);
+            return t ? `rgb(${t})` : fallback;
+        };
+        const themed = triplet('--st-background') !== null || triplet('--st-accent-1') !== null;
+        if (!themed) return FALLBACK;
+        const bodyColor = getComputedStyle(doc.body).color;
+        return {
+            bg: rgb('--st-background', FALLBACK.bg),
+            panel: rgb('--st-color-4', FALLBACK.panel),
+            panelHover: rgb('--st-color-5', FALLBACK.panelHover),
+            border: rgb('--st-color-5', FALLBACK.border),
+            text: bodyColor && bodyColor !== 'rgba(0, 0, 0, 0)' ? bodyColor : FALLBACK.text,
+            muted: FALLBACK.muted,
+            accent: rgb('--st-accent-1', rgb('--SystemAccentColor-RGB', FALLBACK.accent)),
+            green: rgb('--st-green', FALLBACK.green),
+            red: rgb('--st-red', FALLBACK.red),
+            yellow: rgb('--st-yellow', FALLBACK.yellow),
+            mono: FALLBACK.mono,
+        };
+    } catch {
+        return FALLBACK;
+    }
+}
+
+function makeStyles(C: Palette): Record<string, React.CSSProperties> {
+    return {
+        root: {
+            display: 'flex', flexDirection: 'column', height: '100%', minHeight: '560px',
+            background: C.bg, color: C.text, fontSize: '13px',
+        },
+        tabBar: { display: 'flex', gap: '2px', padding: '8px 12px 0 12px', borderBottom: `1px solid ${C.border}`, flexShrink: 0 },
+        tab: { padding: '7px 14px', cursor: 'pointer', borderRadius: '3px 3px 0 0', color: C.muted, userSelect: 'none' },
+        tabActive: { background: C.panel, color: C.text, boxShadow: `inset 0 2px 0 ${C.accent}` },
+        body: { flex: 1, overflowY: 'auto', padding: '12px 16px' },
+        section: { marginBottom: '16px' },
+        sectionTitle: { fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.08em', color: C.muted, margin: '0 0 6px 2px' },
+        row: {
+            display: 'flex', alignItems: 'center', gap: '8px', padding: '5px 8px',
+            background: C.panel, borderRadius: '3px', marginBottom: '4px', border: `1px solid ${C.border}`,
+        },
+        rowDisabled: { opacity: 0.55 },
+        input: {
+            flex: 1, background: 'rgba(0,0,0,0.35)', color: C.text, border: `1px solid ${C.border}`,
+            borderRadius: '2px', padding: '5px 8px', fontFamily: C.mono, fontSize: '12px', outline: 'none', minWidth: 0,
+        },
+        iconBtn: {
+            background: 'transparent', color: C.muted, border: 'none', cursor: 'pointer',
+            padding: '2px 5px', fontSize: '13px', lineHeight: 1, borderRadius: '2px',
+        },
+        addBtn: {
+            background: 'transparent', color: C.accent, border: `1px dashed ${C.border}`, cursor: 'pointer',
+            padding: '5px 10px', borderRadius: '3px', fontSize: '12px', width: '100%', textAlign: 'left',
+        },
+        preview: {
+            flexShrink: 0, borderTop: `2px solid ${C.accent}`, padding: '10px 16px 12px 16px',
+            display: 'flex', flexDirection: 'column', gap: '5px', background: C.panel,
+        },
+        previewText: {
+            fontFamily: C.mono, fontSize: '13px', color: C.text, wordBreak: 'break-all',
+            whiteSpace: 'pre-wrap', minHeight: '18px', userSelect: 'text',
+        },
+        toggle: { cursor: 'pointer', width: '30px', height: '16px', borderRadius: '8px', position: 'relative', flexShrink: 0, transition: 'background 0.15s' },
+        knob: { position: 'absolute', top: '2px', width: '12px', height: '12px', borderRadius: '50%', background: '#fff', transition: 'left 0.15s' },
+        smallBtn: {
+            background: C.panel, color: C.text, border: `1px solid ${C.border}`, cursor: 'pointer',
+            padding: '4px 10px', borderRadius: '2px', fontSize: '12px',
+        },
+        badge: {
+            fontSize: '10px', padding: '1px 6px', borderRadius: '8px', whiteSpace: 'nowrap',
+            border: `1px solid ${C.border}`, color: C.muted,
+        },
+        catHeader: {
+            display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', userSelect: 'none',
+            padding: '7px 10px', background: C.panel, border: `1px solid ${C.border}`,
+            borderRadius: '3px', marginBottom: '4px',
+        },
+    };
+}
+
+const ThemeCtx = createContext<{ C: Palette; S: Record<string, React.CSSProperties> }>({ C: FALLBACK, S: makeStyles(FALLBACK) });
+const useTheme = () => useContext(ThemeCtx);
 
 // ── small components ────────────────────────────────────────────────────────
 
 function MiniToggle(props: { value: boolean; onChange: (v: boolean) => void }) {
+    const { C, S } = useTheme();
     return (
         <div
-            style={{ ...S.toggle, background: props.value ? C.accent : '#3a4350' }}
+            style={{ ...S.toggle, background: props.value ? C.accent : 'rgba(128,128,128,0.35)' }}
             onClick={() => props.onChange(!props.value)}
             title={props.value ? 'Enabled — click to disable (kept, not deleted)' : 'Disabled — click to enable'}
         >
@@ -99,6 +171,7 @@ interface RowProps {
 }
 
 function ItemRow({ item, onChange, onToggle, onDelete, onMove }: RowProps) {
+    const { C, S } = useTheme();
     return (
         <div style={{ ...S.row, ...(item.enabled ? {} : S.rowDisabled) }}>
             <MiniToggle value={item.enabled} onChange={onToggle} />
@@ -121,6 +194,19 @@ const KIND_SECTIONS: { kind: ArgKind; title: string; hint: string; placeholder: 
     { kind: 'flag', title: 'Game arguments (after %command%)', hint: 'passed to the game itself', placeholder: '-novid' },
 ];
 
+// Exact match (normalized tokens; env vars by name) → the preset itself is
+// present. First-token match → a *variant* is present (e.g. another gamescope
+// flag set), shown as a hint without blocking the Add button.
+function presetExactKey(kind: ArgKind, text: string): string {
+    if (kind === 'env') return `env:${text.split('=')[0]}`;
+    return `${kind}:${tokenize(text).join(' ')}`;
+}
+
+function presetSignature(kind: ArgKind, text: string): string {
+    if (kind === 'env') return `env:${text.split('=')[0]}`;
+    return `${kind}:${tokenize(text)[0] ?? text}`;
+}
+
 // ── main window ─────────────────────────────────────────────────────────────
 
 type Tab = 'args' | 'presets' | 'profiles' | 'bulk';
@@ -129,8 +215,16 @@ export function ManagerWindow({ appid }: { appid: number }) {
     const [items, setItems] = useState<ArgItem[] | null>(null);
     const [tab, setTab] = useState<Tab>('args');
     const [status, setStatus] = useState<string>('');
-    const [statusColor, setStatusColor] = useState<string>(C.muted);
+    // semantic key, resolved against the live palette at render time — a
+    // closure-captured color string would freeze the pre-theme fallback
+    const [statusColor, setStatusColor] = useState<keyof Palette>('muted');
+    const [caps, setCaps] = useState<Capabilities | null>(null);
+    const [proton, setProton] = useState<boolean | null>(null);
+    const [theme, setTheme] = useState<{ C: Palette; S: Record<string, React.CSSProperties> }>(
+        () => ({ C: FALLBACK, S: makeStyles(FALLBACK) }));
+    const rootRef = useRef<HTMLDivElement | null>(null);
     const applyTimer = useRef<any>(null);
+    const statusTimer = useRef<any>(null);
     // Items waiting in the debounce window; flushed (not discarded) on unmount
     // so closing the window right after typing doesn't lose the edit.
     const pendingItems = useRef<ArgItem[] | null>(null);
@@ -138,21 +232,51 @@ export function ManagerWindow({ appid }: { appid: number }) {
     // (stale) result over a newer apply's.
     const runSeq = useRef(0);
     const gameName = useMemo(() => getGameName(appid), [appid]);
+    const { C, S } = theme;
+
+    const flash = (msg: string, color: keyof Palette = 'muted', autoClear = false) => {
+        setStatus(msg);
+        setStatusColor(color);
+        if (statusTimer.current) clearTimeout(statusTimer.current);
+        if (autoClear) {
+            statusTimer.current = setTimeout(() => setStatus(''), 2500);
+        }
+    };
 
     useEffect(() => {
-        getGameItems(appid).then(({ items: loadedItems, liveUnknown }) => {
+        // theme probe: own popout document first, falling back to defaults
+        const doc = rootRef.current?.ownerDocument;
+        if (doc) {
+            const palette = readPalette(doc);
+            setTheme({ C: palette, S: makeStyles(palette) });
+        }
+    }, []);
+
+    useEffect(() => {
+        getCapabilities().then(setCaps);
+        onSaveFailure((reason) => {
+            flash(reason === 'loadFailed'
+                ? 'Changes are NOT saved — the plugin store file could not be read'
+                : 'Failed to save plugin data to disk', 'red');
+        });
+        getGameItems(appid).then(({ items: loadedItems, liveUnknown, proton: protonFlag }) => {
             setItems(loadedItems);
-            if (liveUnknown) {
-                flash('Steam did not report current options — showing saved state', '#e8a33d');
+            setProton(protonFlag);
+            if (persistenceBlocked()) {
+                flash('Changes are NOT saved — the plugin store file could not be read', 'red');
+            } else if (liveUnknown) {
+                flash('Steam did not report current options — showing saved state', 'yellow');
             }
         }).catch((e) => {
             console.error('[launch-options-manager] load failed', e);
             setItems([]);
-            flash('Failed to read launch options', C.red);
+            flash('Failed to read launch options', 'red');
         });
         return () => {
+            onSaveFailure(null);
             if (applyTimer.current) clearTimeout(applyTimer.current);
             applyTimer.current = null;
+            if (statusTimer.current) clearTimeout(statusTimer.current);
             if (pendingItems.current) {
                 const next = pendingItems.current;
                 pendingItems.current = null;
@@ -163,11 +287,6 @@ export function ManagerWindow({ appid }: { appid: number }) {
             flushStore();
         };
     }, [appid]);
-
-    const flash = (msg: string, color = C.muted) => {
-        setStatus(msg);
-        setStatusColor(color);
-    };
 
     // Persist + push to Steam, debounced so typing doesn't write partial args.
     const update = (next: ArgItem[], immediate = false) => {
@@ -180,22 +299,19 @@ export function ManagerWindow({ appid }: { appid: number }) {
             const seq = ++runSeq.current;
             const composed = composeLaunchOptions(next);
             setGameItems(appid, next, composed);
-            flash('Applying…', C.muted);
+            flash('Applying…', 'muted');
             try {
                 const verified = await setAndVerifyLaunchOptions(appid, composed);
                 if (seq !== runSeq.current) return; // superseded by a newer apply
-                if (verified) flash('✓ Applied', C.green);
-                else flash('Sent, but Steam did not confirm — check the Properties dialog', '#e8a33d');
+                if (verified) flash('✓ Applied', 'green', true);
+                else flash('Sent, but Steam did not confirm the change', 'yellow');
             } catch (e) {
                 console.error('[launch-options-manager] apply failed', e);
-                if (seq === runSeq.current) flash('Could not apply — SteamClient API unavailable', C.red);
+                if (seq === runSeq.current) flash('Could not apply — SteamClient API unavailable', 'red');
             }
         };
         if (immediate) run();
-        else {
-            flash('…', C.muted);
-            applyTimer.current = setTimeout(run, 600);
-        }
+        else applyTimer.current = setTimeout(run, 600);
     };
 
     // Replace the editor state without re-applying (the caller already wrote
@@ -209,11 +325,17 @@ export function ManagerWindow({ appid }: { appid: number }) {
     };
 
     if (items === null) {
-        return <div style={{ ...S.root, alignItems: 'center', justifyContent: 'center' }}>Loading…</div>;
+        return (
+            <ThemeCtx.Provider value={theme}>
+                <div ref={rootRef} style={{ ...S.root, alignItems: 'center', justifyContent: 'center' }}>Loading…</div>
+            </ThemeCtx.Provider>
+        );
     }
 
     const composed = composeLaunchOptions(items);
     const hasRaw = items.some((it) => it.kind === 'raw');
+    const addedExact = new Set(items.map((it) => presetExactKey(it.kind, it.text)));
+    const addedSignatures = new Set(items.map((it) => presetSignature(it.kind, it.text)));
 
     const changeItem = (id: string, patch: Partial<ArgItem>, immediate = false) =>
         update(items.map((it) => (it.id === id ? { ...it, ...patch } : it)), immediate);
@@ -241,6 +363,9 @@ export function ManagerWindow({ appid }: { appid: number }) {
         update([...items, it], text !== '');
     };
 
+    // %command% highlighted so the structure of the final string stands out
+    const previewParts = (composed || '').split('%command%');
+
     const tabs: { id: Tab; label: string }[] = [
         { id: 'args', label: 'Arguments' },
         { id: 'presets', label: 'Presets' },
@@ -249,70 +374,70 @@ export function ManagerWindow({ appid }: { appid: number }) {
     ];
 
     return (
-        <div style={S.root}>
-            <div style={{ padding: '12px 16px 6px 16px', display: 'flex', alignItems: 'baseline', gap: '10px' }}>
-                <div style={{ fontSize: '17px', fontWeight: 600 }}>{gameName}</div>
-                {isShortcut(appid) && (
-                    <div style={{ color: '#e8a33d', fontSize: '11px' }} title="Steam may not substitute %command% for non-Steam games — wrappers and env vars can be unreliable here.">
-                        non-Steam shortcut
-                    </div>
-                )}
-                <div style={{ color: statusColor, fontSize: '12px', marginLeft: 'auto' }}>{status}</div>
-            </div>
-            <div style={S.tabBar}>
-                {tabs.map((t) => (
-                    <div key={t.id} style={{ ...S.tab, ...(tab === t.id ? S.tabActive : {}) }} onClick={() => setTab(t.id)}>
-                        {t.label}
-                    </div>
-                ))}
-            </div>
-            <div style={S.body}>
-                {tab === 'args' && (
-                    <ArgsTab items={items} hasRaw={hasRaw}
-                        onChange={changeItem} onDelete={deleteItem} onMove={moveItem} onAdd={addItem} />
-                )}
-                {tab === 'presets' && (
-                    <PresetsTab hasRaw={hasRaw}
-                        onAdd={(p) => { addItem(p.kind, p.text); flash(`Added: ${p.text}`, C.green); }} />
-                )}
-                {tab === 'profiles' && (
-                    <ProfilesTab items={items} flash={flash} hasRaw={hasRaw}
-                        onLoad={(profileItems, replace) => {
-                            const copies = profileItems.map((it) => ({ ...makeItem(it.kind, it.text, it.enabled) }));
-                            update(replace ? copies : [...items, ...copies], true);
-                            setTab('args');
-                        }} />
-                )}
-                {tab === 'bulk' && <BulkTab flash={flash} currentAppid={appid} onAppliedToCurrent={adoptItems} />}
-            </div>
-            <div style={S.preview}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                    <span style={{ fontSize: '11px', color: C.muted, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
-                        Launch options
-                    </span>
-                    <button
-                        style={{ ...S.iconBtn, marginLeft: 'auto' }}
-                        title="Copy to clipboard"
-                        onClick={(e) => {
-                            // Must use the popout window's navigator: the
-                            // SharedJSContext global has no document focus and
-                            // its clipboard writes are rejected.
-                            const win = (e.currentTarget as HTMLElement).ownerDocument?.defaultView;
-                            const clipboard = win?.navigator?.clipboard;
-                            if (!clipboard) {
-                                flash('Copy failed — select the text manually', C.red);
-                                return;
-                            }
-                            clipboard.writeText(composed).then(
-                                () => flash('Copied', C.green),
-                                () => flash('Copy failed — select the text manually', C.red),
-                            );
-                        }}
-                    >⧉ copy</button>
+        <ThemeCtx.Provider value={theme}>
+            <div ref={rootRef} style={S.root} className="lom-root">
+                <div style={{ padding: '12px 16px 6px 16px', display: 'flex', alignItems: 'baseline', gap: '10px' }}>
+                    <div style={{ fontSize: '17px', fontWeight: 600 }}>{gameName}</div>
+                    {isShortcut(appid) && (
+                        <div style={{ color: C.yellow, fontSize: '11px' }} title="Steam may not substitute %command% for non-Steam games — wrappers and env vars can be unreliable here.">
+                            non-Steam shortcut
+                        </div>
+                    )}
+                    {proton !== null && !isShortcut(appid) && (
+                        <div style={{ ...S.badge }} title={proton
+                            ? 'Runs through a compatibility tool — Proton/Wine options apply.'
+                            : 'Runs natively on Linux — PROTON_*/WINE* options have no effect.'}>
+                            {proton ? 'Proton' : 'native Linux'}
+                        </div>
+                    )}
                 </div>
-                <div style={S.previewText}>{composed || <span style={{ color: C.muted }}>(empty)</span>}</div>
+                <div style={S.tabBar}>
+                    {tabs.map((t) => (
+                        <div key={t.id} style={{ ...S.tab, ...(tab === t.id ? S.tabActive : {}) }} onClick={() => setTab(t.id)}>
+                            {t.label}
+                        </div>
+                    ))}
+                </div>
+                <div style={S.body}>
+                    {tab === 'args' && (
+                        <ArgsTab items={items} hasRaw={hasRaw}
+                            onChange={changeItem} onDelete={deleteItem} onMove={moveItem} onAdd={addItem} />
+                    )}
+                    {tab === 'presets' && (
+                        <PresetsTab hasRaw={hasRaw} caps={caps} proton={proton}
+                            addedExact={addedExact} addedSignatures={addedSignatures}
+                            onAdd={(p) => { addItem(p.kind, p.text); flash(`Added: ${p.text}`, 'green', true); }} />
+                    )}
+                    {tab === 'profiles' && (
+                        <ProfilesTab items={items} flash={flash} hasRaw={hasRaw}
+                            onLoad={(profileItems, replace) => {
+                                const copies = profileItems.map((it) => ({ ...makeItem(it.kind, it.text, it.enabled) }));
+                                update(replace ? copies : [...items, ...copies], true);
+                                setTab('args');
+                            }} />
+                    )}
+                    {tab === 'bulk' && <BulkTab flash={flash} currentAppid={appid} onAppliedToCurrent={adoptItems} />}
+                </div>
+                <div style={S.preview} className="lom-preview">
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <span style={{ fontSize: '11px', color: C.accent, textTransform: 'uppercase', letterSpacing: '0.1em', fontWeight: 600 }}>
+                            Current launch options
+                        </span>
+                        <span style={{ color: C[statusColor] as string, fontSize: '12px', marginLeft: 'auto' }}>{status}</span>
+                    </div>
+                    <div style={S.previewText}>
+                        {composed
+                            ? previewParts.map((part, i) => (
+                                <React.Fragment key={i}>
+                                    {i > 0 && <span style={{ color: C.accent, fontWeight: 600 }}>%command%</span>}
+                                    {part}
+                                </React.Fragment>
+                            ))
+                            : <span style={{ color: C.muted }}>(empty — Steam launches the game unmodified)</span>}
+                    </div>
+                </div>
             </div>
-        </div>
+        </ThemeCtx.Provider>
     );
 }
 
@@ -326,6 +451,7 @@ function ArgsTab(props: {
     onAdd: (kind: ArgKind, text?: string) => void;
 }) {
     const { items, hasRaw, onChange, onDelete, onMove, onAdd } = props;
+    const { C, S } = useTheme();
 
     if (hasRaw) {
         const raw = items.find((it) => it.kind === 'raw')!;
@@ -376,13 +502,29 @@ function ArgsTab(props: {
     );
 }
 
-function PresetsTab({ onAdd, hasRaw }: { onAdd: (p: Preset) => void; hasRaw: boolean }) {
+// Why a preset may not work here; null = no objection.
+function presetIssue(p: Preset, caps: Capabilities | null, proton: boolean | null): string | null {
+    if (p.bin && caps && caps.bins[p.bin] === false) return `${p.bin} is not installed`;
+    if (p.proton && proton === false) return 'Proton games only — this game runs natively';
+    if (p.gpu === 'nvidia' && caps && !caps.nvidia) return 'NVIDIA driver not detected';
+    if (p.gpu === 'amd' && caps && caps.nvidia && !caps.amd) return 'AMD-only option';
+    // Mesa drives AMD and Intel GPUs; only flag when neither is present
+    if (p.gpu === 'mesa' && caps && caps.nvidia && !caps.amd && !caps.intel) return 'Mesa option — no Mesa GPU detected';
+    return null;
+}
+
+function PresetsTab(props: {
+    onAdd: (p: Preset) => void;
+    hasRaw: boolean;
+    caps: Capabilities | null;
+    proton: boolean | null;
+    addedExact: Set<string>;
+    addedSignatures: Set<string>;
+}) {
+    const { onAdd, hasRaw, caps, proton, addedExact, addedSignatures } = props;
+    const { C, S } = useTheme();
     const [filter, setFilter] = useState('');
-    const lower = filter.toLowerCase();
-    const visible = PRESETS.filter(
-        (p) => !lower || p.text.toLowerCase().includes(lower) || p.description.toLowerCase().includes(lower),
-    );
-    const categories = [...new Set(visible.map((p) => p.category))];
+    const [openCats, setOpenCats] = useState<string[]>(() => getUISettings().openCategories);
 
     if (hasRaw) {
         return (
@@ -394,6 +536,19 @@ function PresetsTab({ onAdd, hasRaw }: { onAdd: (p: Preset) => void; hasRaw: boo
         );
     }
 
+    const lower = filter.toLowerCase();
+    const filtering = lower.length > 0;
+    const visible = PRESETS.filter(
+        (p) => !filtering || p.text.toLowerCase().includes(lower) || p.description.toLowerCase().includes(lower),
+    );
+    const categories = [...new Set(visible.map((p) => p.category))];
+
+    const toggleCat = (cat: string) => {
+        const next = openCats.includes(cat) ? openCats.filter((c) => c !== cat) : [...openCats, cat];
+        setOpenCats(next);
+        updateUISettings({ openCategories: next });
+    };
+
     return (
         <div>
             <input
@@ -403,20 +558,39 @@ function PresetsTab({ onAdd, hasRaw }: { onAdd: (p: Preset) => void; hasRaw: boo
                 spellCheck={false}
                 onChange={(e) => setFilter((e.target as HTMLInputElement).value)}
             />
-            {categories.map((cat) => (
-                <div key={cat} style={S.section}>
-                    <div style={S.sectionTitle}>{cat}</div>
-                    {visible.filter((p) => p.category === cat).map((p) => (
-                        <div key={p.text} style={S.row}>
-                            <div style={{ flex: 1, minWidth: 0 }}>
-                                <div style={{ fontFamily: C.mono, fontSize: '12px' }}>{p.text}</div>
-                                <div style={{ color: C.muted, fontSize: '11px', marginTop: '2px' }}>{p.description}</div>
-                            </div>
-                            <button style={S.smallBtn} onClick={() => onAdd(p)}>+ Add</button>
+            {categories.map((cat) => {
+                const catPresets = visible.filter((p) => p.category === cat);
+                const open = filtering || openCats.includes(cat);
+                return (
+                    <div key={cat} style={{ marginBottom: '8px' }}>
+                        <div style={S.catHeader} onClick={() => !filtering && toggleCat(cat)}>
+                            <span style={{ fontSize: '10px', color: C.muted }}>{open ? '▾' : '▸'}</span>
+                            <span style={{ fontWeight: 600 }}>{cat}</span>
+                            <span style={{ color: C.muted, fontSize: '11px', marginLeft: 'auto' }}>{catPresets.length}</span>
                         </div>
-                    ))}
-                </div>
-            ))}
+                        {open && catPresets.map((p) => {
+                            const exact = addedExact.has(presetExactKey(p.kind, p.text));
+                            const similar = !exact && addedSignatures.has(presetSignature(p.kind, p.text));
+                            const issue = presetIssue(p, caps, proton);
+                            return (
+                                <div key={p.text} style={{ ...S.row, ...(issue ? { opacity: 0.6 } : {}) }}>
+                                    <div style={{ flex: 1, minWidth: 0 }}>
+                                        <div style={{ fontFamily: C.mono, fontSize: '12px', display: 'flex', gap: '8px', alignItems: 'center' }}>
+                                            {p.text}
+                                            {issue && <span style={{ ...S.badge, color: C.yellow, borderColor: C.yellow }}>{issue}</span>}
+                                            {similar && <span style={S.badge}>similar item present</span>}
+                                        </div>
+                                        <div style={{ color: C.muted, fontSize: '11px', marginTop: '2px' }}>{p.description}</div>
+                                    </div>
+                                    {exact
+                                        ? <span style={{ ...S.badge, color: C.green, borderColor: C.green }}>✓ added</span>
+                                        : <button style={S.smallBtn} onClick={() => onAdd(p)}>{similar ? '+ Add variant' : '+ Add'}</button>}
+                                </div>
+                            );
+                        })}
+                    </div>
+                );
+            })}
         </div>
     );
 }
@@ -424,16 +598,23 @@ function PresetsTab({ onAdd, hasRaw }: { onAdd: (p: Preset) => void; hasRaw: boo
 function ProfilesTab(props: {
     items: ArgItem[];
     hasRaw: boolean;
-    flash: (msg: string, color?: string) => void;
+    flash: (msg: string, color?: keyof Palette, autoClear?: boolean) => void;
     onLoad: (items: ArgItem[], replace: boolean) => void;
 }) {
     const { items, hasRaw, flash, onLoad } = props;
+    const { C, S } = useTheme();
     const [name, setName] = useState('');
     const [, bump] = useState(0);
     const profiles = getProfiles();
 
     return (
         <div>
+            <div style={{ ...S.section, color: C.muted, lineHeight: 1.6 }}>
+                A profile is a named, reusable set of arguments. Build the set you like on the
+                <b> Arguments</b> tab, save it here, then <b>Load</b> it onto any other game (replacing its
+                arguments) or <b>+ Merge</b> it on top of them. <b>Bulk apply</b> writes a profile to many
+                games at once. Profiles are copies — editing a game later doesn't change the profile.
+            </div>
             <div style={S.section}>
                 <div style={S.sectionTitle}>Save current arguments as a profile</div>
                 <div style={{ display: 'flex', gap: '8px' }}>
@@ -448,7 +629,7 @@ function ProfilesTab(props: {
                         disabled={!name.trim() || !items.length}
                         onClick={() => {
                             saveProfile(name.trim(), items);
-                            flash(`Profile "${name.trim()}" saved`, C.green);
+                            flash(`Profile "${name.trim()}" saved`, 'green', true);
                             setName('');
                             bump((n) => n + 1);
                         }}
@@ -485,15 +666,17 @@ function ProfilesTab(props: {
 }
 
 function BulkTab(props: {
-    flash: (msg: string, color?: string) => void;
+    flash: (msg: string, color?: keyof Palette, autoClear?: boolean) => void;
     currentAppid: number;
     onAppliedToCurrent: (items: ArgItem[]) => void;
 }) {
     const { flash, currentAppid, onAppliedToCurrent } = props;
+    const { C, S } = useTheme();
     const [profileName, setProfileName] = useState('');
     const [filter, setFilter] = useState('');
     const [selected, setSelected] = useState<Set<number>>(new Set());
     const games = useMemo(() => getAllGames(), []);
+    const collections = useMemo(() => getUserCollections(), []);
     const profiles = getProfiles();
 
     const lower = filter.toLowerCase();
@@ -505,6 +688,8 @@ function BulkTab(props: {
         else next.add(appid);
         setSelected(next);
     };
+
+    const selectSet = (appids: number[]) => setSelected(new Set(appids));
 
     const apply = () => {
         const profile = profiles.find((p) => p.name === profileName);
@@ -522,7 +707,7 @@ function BulkTab(props: {
             }
         }
         flushStore();
-        flash(`Profile applied to ${ok} game${ok === 1 ? '' : 's'}`, C.green);
+        flash(`Profile applied to ${ok} game${ok === 1 ? '' : 's'}`, 'green', true);
         setSelected(new Set());
     };
 
@@ -545,13 +730,22 @@ function BulkTab(props: {
                 <div style={S.sectionTitle}>
                     Games <span style={{ opacity: 0.6 }}>— {selected.size} selected; replaces their launch options</span>
                 </div>
+                <div style={{ display: 'flex', gap: '6px', marginBottom: '8px', flexWrap: 'wrap' }}>
+                    <button style={S.smallBtn} onClick={() => selectSet(games.map((g) => g.appid))}>All games</button>
+                    <button style={S.smallBtn} onClick={() => selectSet(games.filter((g) => g.installed).map((g) => g.appid))}>All installed</button>
+                    {collections.map((c) => (
+                        <button key={c.id} style={S.smallBtn} title={`Select the "${c.name}" collection (${c.appids.length} games)`}
+                            onClick={() => selectSet(c.appids)}>{c.name}</button>
+                    ))}
+                    <button style={{ ...S.smallBtn, color: C.muted }} onClick={() => setSelected(new Set())}>Clear</button>
+                </div>
                 <input
                     style={{ ...S.input, width: '100%', boxSizing: 'border-box', marginBottom: '8px' }}
                     placeholder="Filter games…"
                     value={filter}
                     onChange={(e) => setFilter((e.target as HTMLInputElement).value)}
                 />
-                <div style={{ maxHeight: '260px', overflowY: 'auto', border: `1px solid ${C.border}`, borderRadius: '3px' }}>
+                <div style={{ maxHeight: '240px', overflowY: 'auto', border: `1px solid ${C.border}`, borderRadius: '3px' }}>
                     {visible.map((g: GameEntry) => (
                         <div key={g.appid}
                             style={{

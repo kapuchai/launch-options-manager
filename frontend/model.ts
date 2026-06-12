@@ -29,13 +29,28 @@ export interface Profile {
     items: ArgItem[];
 }
 
+export interface UISettings {
+    showAppButton: boolean;
+    showPropsButton: boolean;
+    openCategories: string[];
+    defaultProfileSeeded: boolean;
+}
+
+export const defaultUISettings = (): UISettings => ({
+    showAppButton: true,
+    showPropsButton: true,
+    openCategories: [],
+    defaultProfileSeeded: false,
+});
+
 export interface Store {
     version: 1;
     games: Record<string, GameConfig>;
     profiles: Profile[];
+    ui: UISettings;
 }
 
-export const emptyStore = (): Store => ({ version: 1, games: {}, profiles: [] });
+export const emptyStore = (): Store => ({ version: 1, games: {}, profiles: [], ui: defaultUISettings() });
 
 let idCounter = 0;
 export const newId = (): string => `${Date.now().toString(36)}-${(idCounter++).toString(36)}`;

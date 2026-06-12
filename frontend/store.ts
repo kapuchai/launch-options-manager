@@ -1,59 +1,155 @@
 import { callable } from '@steambrew/client';
-import { ArgItem, GameConfig, Profile, Store, emptyStore, reconcile } from './model';
+import { ArgItem, GameConfig, Profile, Store, UISettings, defaultUISettings, emptyStore, makeItem, reconcile } from './model';
 
 declare const SteamClient: any;
 declare const appStore: any;
 declare const appDetailsStore: any;
+declare const collectionStore: any;
 
 const backendGetStore = callable<[], string>('GetStore');
-const backendSetStore = callable<[{ a_json: string }], boolean>('SetStore');
+const backendSetStore = callable<[{ a_json: string }], string>('SetStore');
+const backendGetCapabilities = callable<[], string>('GetCapabilities');
 
 let store: Store = emptyStore();
-let loaded = false;
 // When the existing store file couldn't be read/understood, refuse all writes:
 // otherwise the first routine save would replace the user's real data with an
 // empty store plus one edit.
 let loadFailed = false;
 
-export async function loadStore(): Promise<Store> {
-    if (loaded) return store;
+export function persistenceBlocked(): boolean {
+    return loadFailed;
+}
+
+// Surfaced in the manager UI; console-only errors go unseen by most users.
+let saveFailureHandler: ((reason: 'loadFailed' | 'backend') => void) | null = null;
+export function onSaveFailure(cb: ((reason: 'loadFailed' | 'backend') => void) | null): void {
+    saveFailureHandler = cb;
+}
+
+// Memoized so concurrent callers (startup preload + an early manager window)
+// share one load — a second concurrent run would re-derive the store and
+// double-seed the Default profile.
+let loadPromise: Promise<Store> | null = null;
+
+export function loadStore(): Promise<Store> {
+    if (!loadPromise) loadPromise = doLoadStore();
+    return loadPromise;
+}
+
+async function doLoadStore(): Promise<Store> {
     try {
-        const raw = await backendGetStore();
-        if (raw && raw.trim()) {
-            const parsed = JSON.parse(raw);
-            if (parsed && parsed.version === 1) {
-                store = {
-                    version: 1,
-                    games: parsed.games && typeof parsed.games === 'object' && !Array.isArray(parsed.games) ? parsed.games : {},
-                    profiles: Array.isArray(parsed.profiles) ? parsed.profiles : [],
-                };
-            } else {
-                console.error('[launch-options-manager] Store has unknown version — refusing to overwrite it', parsed?.version);
-                loadFailed = true;
-            }
+        const raw = String((await backendGetStore()) ?? '');
+        const parsed = raw.trim() ? JSON.parse(raw) : null;
+        if (parsed && parsed.__firstRun) {
+            // no file yet — fresh writable store
+        } else if (parsed && parsed.__readError) {
+            console.error('[launch-options-manager] Backend could not read the store file — persistence disabled');
+            loadFailed = true;
+        } else if (parsed && parsed.version === 1) {
+            store = {
+                version: 1,
+                games: parsed.games && typeof parsed.games === 'object' && !Array.isArray(parsed.games) ? parsed.games : {},
+                profiles: Array.isArray(parsed.profiles) ? parsed.profiles : [],
+                ui: { ...defaultUISettings(), ...(parsed.ui && typeof parsed.ui === 'object' ? parsed.ui : {}) },
+            };
+        } else {
+            console.error('[launch-options-manager] Store has unexpected content — refusing to overwrite it', parsed?.version);
+            loadFailed = true;
         }
     } catch (e) {
         console.error('[launch-options-manager] Failed to load store — persistence disabled to protect the file', e);
         loadFailed = true;
     }
-    loaded = true;
+    if (!loadFailed) seedDefaultProfile();
     return store;
+}
+
+// First-run convenience: a starter profile so the Profiles tab demonstrates
+// the workflow. Created once; deleting it is respected. The seeded flag is
+// set in the same step that pushes the profile, so a flush in between can
+// never persist the flag without the profile.
+function seedDefaultProfile(): void {
+    if (store.ui.defaultProfileSeeded || store.profiles.length) {
+        store.ui.defaultProfileSeeded = true;
+        return;
+    }
+    getCapabilities().then((caps) => {
+        if (store.ui.defaultProfileSeeded || store.profiles.length) {
+            store.ui.defaultProfileSeeded = true;
+            return;
+        }
+        const has = (bin: string) => Boolean(caps?.bins?.[bin]);
+        const wrapper = has('game-performance') ? 'game-performance' : 'gamemoderun';
+        store.ui.defaultProfileSeeded = true;
+        store.profiles.push({
+            name: 'Default',
+            items: [
+                // enabled only when the binary actually exists — an enabled
+                // wrapper pointing at a missing binary breaks game launches
+                makeItem('wrapper', wrapper, has(wrapper)),
+                makeItem('wrapper', 'mangohud', has('mangohud')),
+            ],
+        });
+        saveStore();
+    });
+}
+
+// ── System capabilities (for preset usability hints) ───────────────────────
+
+export interface Capabilities {
+    bins: Record<string, boolean>;
+    nvidia: boolean;
+    amd: boolean;
+    intel: boolean;
+}
+
+let capsPromise: Promise<Capabilities | null> | null = null;
+
+export function getCapabilities(): Promise<Capabilities | null> {
+    if (!capsPromise) {
+        capsPromise = backendGetCapabilities()
+            .then((raw) => {
+                const parsed = JSON.parse(String(raw));
+                return parsed && parsed.bins ? (parsed as Capabilities) : null;
+            })
+            .catch((e) => {
+                console.error('[launch-options-manager] capability probe failed', e);
+                return null;
+            })
+            .then((caps) => {
+                // don't memoize a transient failure for the whole session
+                if (caps === null) capsPromise = null;
+                return caps;
+            });
+    }
+    return capsPromise;
 }
 
 let saveTimer: any = null;
 
+let loggedLoadFailedRefusal = false;
+
 async function doSave(): Promise<boolean> {
     if (loadFailed) {
-        console.error('[launch-options-manager] Not persisting: the store failed to load this session');
+        if (!loggedLoadFailedRefusal) {
+            loggedLoadFailedRefusal = true;
+            console.error('[launch-options-manager] Not persisting: the store failed to load this session');
+        }
+        saveFailureHandler?.('loadFailed');
         return false;
     }
     try {
         const res: any = await backendSetStore({ a_json: JSON.stringify(store, null, 2) });
-        const ok = res === true || res === 'true';
-        if (!ok) console.error('[launch-options-manager] Backend failed to persist the store (disk full / permissions?)');
+        let ok = false;
+        try { ok = JSON.parse(String(res))?.ok === true; } catch { /* not the sentinel */ }
+        if (!ok) {
+            console.error('[launch-options-manager] Backend failed to persist the store (disk full / permissions?)');
+            saveFailureHandler?.('backend');
+        }
         return ok;
     } catch (e) {
         console.error('[launch-options-manager] Failed to save store', e);
+        saveFailureHandler?.('backend');
         return false;
     }
 }
@@ -132,12 +228,6 @@ function readOptionsFromDetails(details: any): string {
     return details.strLaunchOptions ?? '';
 }
 
-// null = the read failed (details never loaded) — distinct from a confirmed
-// empty launch-options string.
-export async function getLiveLaunchOptions(appid: number): Promise<string | null> {
-    const details = await waitForAppDetails(appid, 1500);
-    return details ? readOptionsFromDetails(details) : null;
-}
 
 export function setLaunchOptions(appid: number, options: string): boolean {
     const apps = SteamClient?.Apps;
@@ -209,6 +299,10 @@ export interface GameLoad {
     // True when Steam never delivered app details — the items come from the
     // plugin store alone and must not be reconciled against a phantom ''.
     liveUnknown: boolean;
+    // null = unknown (details unavailable); true = runs through a compat tool
+    // (Proton & friends), so PROTON_*/WINE* options are meaningful.
+    proton: boolean | null;
+    compatTool: string;
 }
 
 // Load the item list for a game, reconciling stored state with whatever is
@@ -217,11 +311,18 @@ export async function getGameItems(appid: number): Promise<GameLoad> {
     await loadStore();
     const key = String(appid);
     const cfg = store.games[key];
-    const live = await getLiveLaunchOptions(appid);
-    if (live === null) {
-        return { items: cfg?.items ?? [], liveUnknown: true };
+    const details = await waitForAppDetails(appid, 1500);
+    if (!details) {
+        return { items: cfg?.items ?? [], liveUnknown: true, proton: null, compatTool: '' };
     }
-    return { items: reconcile(cfg?.items, cfg?.lastApplied, live), liveUnknown: false };
+    const compatTool = (details.strCompatToolName ?? '') as string;
+    const live = readOptionsFromDetails(details);
+    return {
+        items: reconcile(cfg?.items, cfg?.lastApplied, live),
+        liveUnknown: false,
+        proton: Boolean(compatTool),
+        compatTool,
+    };
 }
 
 export function setGameItems(appid: number, items: ArgItem[], applied: string): void {
@@ -255,4 +356,45 @@ export function saveProfile(name: string, items: ArgItem[]): void {
 export function deleteProfile(name: string): void {
     store.profiles = store.profiles.filter((p) => p.name !== name);
     flushStore();
+}
+
+// ── UI settings ─────────────────────────────────────────────────────────────
+
+export function getUISettings(): UISettings {
+    return store.ui;
+}
+
+export function updateUISettings(patch: Partial<UISettings>): void {
+    store.ui = { ...store.ui, ...patch };
+    saveStore();
+}
+
+// ── Collections (for bulk-apply selection helpers) ──────────────────────────
+
+export interface CollectionEntry {
+    id: string;
+    name: string;
+    appids: number[];
+}
+
+export function getUserCollections(): CollectionEntry[] {
+    try {
+        const userCollections = (collectionStore?.userCollections ?? []) as any[];
+        return userCollections
+            .map((c) => ({
+                id: String(c.id),
+                name: String(c.displayName ?? c.id),
+                // same predicate as getAllGames — collections may also hold
+                // soundtracks/tools that must not receive launch options
+                appids: (c.allApps ?? [])
+                    .filter((a: any) => {
+                        try { return a.app_type === 1 || a.BIsShortcut?.(); } catch { return false; }
+                    })
+                    .map((a: any) => a.appid as number),
+            }))
+            .filter((c) => c.appids.length > 0);
+    } catch (e) {
+        console.error('[launch-options-manager] reading collections failed', e);
+        return [];
+    }
 }

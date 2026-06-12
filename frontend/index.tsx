@@ -1,11 +1,17 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { DialogButton, IconsModule, Millennium, definePlugin, findModule, showModal } from '@steambrew/client';
+import { Field, IconsModule, Millennium, Toggle, definePlugin, findModule, showModal, sleep } from '@steambrew/client';
 import { ManagerWindow } from './manager';
 import { composeLaunchOptions } from './model';
-import { flushStore, getGameName, getStore, loadStore } from './store';
+import { flushStore, getGameName, getStore, getUISettings, loadStore, persistenceBlocked, updateUISettings } from './store';
+import { getMainWindowPopup, setMainWindowPopup } from './windows';
 
 declare const uiStore: any;
+// Steam global that materializes after the main window boots. Accessed as a
+// bare identifier inside try/catch (the proven steam-librarian pattern):
+// plugins run in an isolated context where `window.MainWindowBrowserManager`
+// stays undefined even once the global is reachable by name.
+declare const MainWindowBrowserManager: any;
 
 const WaitForElement = async (sel: string, parent: any = document) =>
     [...(await Millennium.findElement(parent, sel))][0] as HTMLElement;
@@ -13,13 +19,10 @@ const WaitForElement = async (sel: string, parent: any = document) =>
 const WaitForElementTimeout = async (sel: string, parent: any = document, timeOut = 2000) =>
     [...(await Millennium.findElement(parent, sel, timeOut))][0] as HTMLElement;
 
-// The main desktop window's popup object; preferred parent for pop-outs so
-// the manager survives the window it was opened from.
-let mainWindowPopup: any = null;
 let openModal: { Close: () => void } | null = null;
 
 function openManager(triggerPopup: any, appid: number) {
-    const parentWindow = (mainWindowPopup ?? triggerPopup)?.m_popup?.window;
+    const parentWindow = (getMainWindowPopup() ?? triggerPopup)?.m_popup?.window;
     try { openModal?.Close(); } catch { /* already closed */ }
     openModal = showModal(<ManagerWindow appid={appid} />, parentWindow, {
         strTitle: `Launch Options — ${getGameName(appid)}`,
@@ -30,12 +33,21 @@ function openManager(triggerPopup: any, appid: number) {
     });
 }
 
-// ── app page: button next to the ⚙ settings button ─────────────────────────
+// ── app page: small button next to the ⚙ in the action row ─────────────────
 
 async function injectAppPageButton(popup: any) {
+    const doc = popup?.m_popup?.document;
+    if (!doc) return;
+    const existing = doc.querySelector('div.lom-button');
+    if (!getUISettings().showAppButton) {
+        existing?.remove();
+        return;
+    }
+    if (existing) return;
+
     const gameSettingsButton = await WaitForElement(
         `div.${findModule((e: any) => e.InPage).InPage} div.${findModule((e: any) => e.AppButtonsContainer).AppButtonsContainer} > div.${findModule((e: any) => e.MenuButtonContainer).MenuButtonContainer}:not([role="button"])`,
-        popup.m_popup.document,
+        doc,
     );
     if (gameSettingsButton.parentNode!.querySelector('div.lom-button')) return;
 
@@ -51,7 +63,7 @@ async function injectAppPageButton(popup: any) {
     });
 }
 
-// ── properties dialog: button on the General page ───────────────────────────
+// ── properties dialog: compact link on the General/Shortcut page ────────────
 
 async function injectPropertiesButton(popup: any, panel: HTMLElement, appid: number) {
     if (panel.querySelector('.lom-props-button')) return;
@@ -59,12 +71,13 @@ async function injectPropertiesButton(popup: any, panel: HTMLElement, appid: num
 
     const container = popup.m_popup.document.createElement('div');
     container.classList.add('lom-props-button');
-    container.style.marginTop = '12px';
+    container.style.cssText = 'display:flex;justify-content:flex-end;margin-top:4px;';
     dialogBody.appendChild(container);
     createRoot(container).render(
-        <DialogButton style={{ width: '100%' }} onClick={() => openManager(popup, appid)}>
-            ⚡ Open Launch Options Manager
-        </DialogButton>,
+        <a
+            style={{ fontSize: '12px', cursor: 'pointer', opacity: 0.75, textDecoration: 'underline' }}
+            onClick={() => openManager(popup, appid)}
+        >⚡ Launch Options Manager…</a>,
     );
 }
 
@@ -76,6 +89,7 @@ async function watchPropertiesDialog(popup: any) {
     const appid = parseInt(match[1], 10);
 
     const tryInject = () => {
+        if (!getUISettings().showPropsButton) return;
         // general = regular games; shortcut = non-Steam games' equivalent page
         if (/\/properties\/(general|shortcut)_Content$/.test(panel.id)) {
             injectPropertiesButton(popup, panel, appid).catch((e) =>
@@ -94,24 +108,24 @@ const boundBrowsers = new WeakSet<object>();
 
 async function OnPopupCreation(popup: any) {
     if (popup.m_strName === 'SP Desktop_uid0') {
-        mainWindowPopup = popup;
-        // MainWindowBrowserManager is a SharedJSContext global that only
-        // exists once the main window finished booting — poll for it.
+        setMainWindowPopup(popup);
         let mwbm: any = undefined;
         while (!mwbm) {
-            mwbm = (window as any).MainWindowBrowserManager;
-            if (!mwbm) await new Promise((r) => setTimeout(r, 200));
+            try {
+                mwbm = MainWindowBrowserManager;
+            } catch {
+                await sleep(200);
+            }
         }
         if (boundBrowsers.has(mwbm.m_browser)) return;
         boundBrowsers.add(mwbm.m_browser);
         mwbm.m_browser.on('finished-request', () => {
             if (mwbm.m_lastLocation.pathname.startsWith('/library/app/')) {
-                // use the current main window popup, not the captured one —
-                // the listener can outlive a re-created window
-                injectAppPageButton(mainWindowPopup ?? popup).catch((e) =>
+                injectAppPageButton(getMainWindowPopup() ?? popup).catch((e) =>
                     console.error('[launch-options-manager] app page inject failed', e));
             }
         });
+        console.log('[launch-options-manager] navigation listener attached');
     } else if (popup.m_strName?.startsWith('PopupWindow_')) {
         watchPropertiesDialog(popup).catch(() => { /* not a game properties dialog */ });
     }
@@ -120,14 +134,34 @@ async function OnPopupCreation(popup: any) {
 // ── Millennium settings panel ───────────────────────────────────────────────
 
 function SettingsContent() {
+    const [ready, setReady] = useState(false);
+    const [, bump] = useState(0);
+    useEffect(() => { loadStore().then(() => setReady(true)); }, []);
+    if (!ready) return <div>Loading…</div>;
+
+    const ui = getUISettings();
     const store = getStore();
     const games = Object.keys(store.games);
+    const setUI = (patch: Partial<typeof ui>) => {
+        updateUISettings(patch);
+        flushStore();
+        bump((n) => n + 1);
+    };
+
     return (
         <div style={{ lineHeight: 1.6 }}>
-            <p>
-                Open a game's library page and click the <b>⚡</b> button next to the settings (⚙) button,
-                or use the button at the bottom of <i>Properties → General</i>.
-            </p>
+            {persistenceBlocked() && (
+                <div style={{ color: '#f04a4a', border: '1px solid #f04a4a', borderRadius: '3px', padding: '8px 12px', marginBottom: '10px' }}>
+                    The plugin store file could not be read — settings and argument changes will NOT be saved.
+                    Check <code>lom-store.json</code> in the plugin directory (a backup may exist as <code>lom-store.json.bak</code>).
+                </div>
+            )}
+            <Field label="Game page button" description="Show the ⚡ button next to the ⚙ button on every game's library page" bottomSeparator="standard" focusable>
+                <Toggle value={ui.showAppButton} onChange={(v: boolean) => setUI({ showAppButton: v })} />
+            </Field>
+            <Field label="Properties dialog link" description="Show the small 'Launch Options Manager…' link in game Properties → General" bottomSeparator="standard" focusable>
+                <Toggle value={ui.showPropsButton} onChange={(v: boolean) => setUI({ showPropsButton: v })} />
+            </Field>
             <p style={{ opacity: 0.7 }}>
                 {games.length} game{games.length === 1 ? '' : 's'} with managed options · {store.profiles.length} profile{store.profiles.length === 1 ? '' : 's'}
             </p>
