@@ -1,10 +1,8 @@
 # Launch Options Manager
 
-A [Millennium](https://steambrew.app/) plugin for desktop Steam on Linux that replaces the tiny
-launch-options text field with a full, per-game launch options manager. Every change applies to
-Steam instantly — no restarts.
-
-> 🤖 Built end-to-end by **Claude Fable 5** (Anthropic) in Claude Code.
+A [Millennium](https://steambrew.app/) plugin that replaces Steam's tiny launch-options text
+field with a full, per-game launch options manager. Every change applies to Steam instantly —
+no restarts.
 
 ## Features
 
@@ -31,20 +29,18 @@ Steam instantly — no restarts.
 
 ## Installation
 
-Until it's available on the [Millennium plugin store](https://steambrew.app/plugins):
+Until it's available on the [Millennium plugin store](https://steambrew.app/plugins), download
+the [latest release](https://github.com/kapuchai/launch-options-manager/releases) (or clone this
+repository) into Millennium's plugins folder:
 
-```sh
-git clone https://github.com/kapuchai/launch-options-manager.git
-ln -s "$(pwd)/launch-options-manager" ~/.local/share/millennium/plugins/
-```
+- **Linux:** `~/.local/share/millennium/plugins/`
+- **Windows:** `<Steam folder>\plugins\`
 
-Enable **Launch Options Manager** in Steam → Millennium → Plugins, then restart Steam.
+Then enable **Launch Options Manager** in Steam → Millennium → Plugins and restart Steam.
+Requires Millennium ≥ 3.2. No build step needed — the plugin ships prebuilt.
 
-Requires Millennium ≥ 3.2. The prebuilt bundle is checked in (`.millennium/Dist/`); to rebuild:
-
-```sh
-npm install --legacy-peer-deps && npm run build
-```
+Note: the wrapper/environment-variable presets target Linux/Proton; on Windows the useful surface
+is game flags, profiles, bulk apply, and ProtonDB data.
 
 ## Data
 
@@ -55,3 +51,7 @@ string — uninstalling the plugin leaves your games exactly as configured.
 ## License
 
 MIT
+
+---
+
+🤖 Built with **Claude Fable 5**
