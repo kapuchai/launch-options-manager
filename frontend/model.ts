@@ -69,8 +69,10 @@ const ENV_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 const COMMAND_TOKEN = '%command%';
 
 // Constructs we don't try to model structurally; the string is kept as one
-// opaque "raw" item the user edits as plain text.
-const COMPLEX_RE = /(;|&&|\|\||\||\$\(|`|\n)/;
+// opaque "raw" item the user edits as plain text. Backslashes are included
+// because tokenize() has no escape handling — splitting "My\ Path" tokens
+// apart would compose broken strings when individual items are toggled.
+const COMPLEX_RE = /(;|&&|\|\||\||\$\(|`|\\|\n)/;
 
 export function tokenize(input: string): string[] {
     const tokens: string[] = [];
@@ -158,10 +160,12 @@ export function parseLaunchOptions(raw: string): ArgItem[] {
 }
 
 export function composeLaunchOptions(items: ArgItem[]): string {
-    const enabled = items.filter((it) => it.enabled && it.text.trim());
-    const raw = enabled.find((it) => it.kind === 'raw');
-    if (raw) return raw.text.trim();
+    // Any raw item — even disabled or empty — keeps the config in raw mode, so
+    // structured items can never leak into Steam invisibly alongside it.
+    const rawItem = items.find((it) => it.kind === 'raw');
+    if (rawItem) return rawItem.enabled ? rawItem.text.trim() : '';
 
+    const enabled = items.filter((it) => it.enabled && it.text.trim());
     const env = enabled.filter((it) => it.kind === 'env').map((it) => it.text.trim());
     const wrappers = enabled.filter((it) => it.kind === 'wrapper').map((it) => it.text.trim());
     const flags = enabled.filter((it) => it.kind === 'flag').map((it) => it.text.trim());
@@ -182,6 +186,13 @@ export function reconcile(stored: ArgItem[] | undefined, lastApplied: string | u
     }
     const parsed = parseLaunchOptions(live);
     const liveTexts = new Set(parsed.map((it) => it.text));
-    const keptDisabled = stored.filter((it) => !it.enabled && !liveTexts.has(it.text));
+    // Token-level containment too: a disabled "-w 1920 -h 1080" re-added
+    // outside the plugin parses as two separate items, not one equal text.
+    const liveTokens = new Set(parsed.flatMap((it) => tokenize(it.text)));
+    const keptDisabled = stored.filter((it) =>
+        !it.enabled
+        && it.text.trim()
+        && !liveTexts.has(it.text)
+        && !tokenize(it.text).every((t) => liveTokens.has(t)));
     return [...parsed, ...keptDisabled];
 }

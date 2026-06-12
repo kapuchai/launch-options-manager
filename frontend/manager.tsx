@@ -4,6 +4,7 @@ import { ArgItem, ArgKind, composeLaunchOptions, makeItem, parseLaunchOptions } 
 import { PRESETS, Preset } from './presets';
 import {
     GameEntry,
+    flushStore,
     getAllGames,
     getGameItems,
     getGameName,
@@ -130,15 +131,37 @@ export function ManagerWindow({ appid }: { appid: number }) {
     const [status, setStatus] = useState<string>('');
     const [statusColor, setStatusColor] = useState<string>(C.muted);
     const applyTimer = useRef<any>(null);
+    // Items waiting in the debounce window; flushed (not discarded) on unmount
+    // so closing the window right after typing doesn't lose the edit.
+    const pendingItems = useRef<ArgItem[] | null>(null);
+    // Monotonic apply counter — a superseded verification must not flash its
+    // (stale) result over a newer apply's.
+    const runSeq = useRef(0);
     const gameName = useMemo(() => getGameName(appid), [appid]);
 
     useEffect(() => {
-        getGameItems(appid).then(setItems).catch((e) => {
+        getGameItems(appid).then(({ items: loadedItems, liveUnknown }) => {
+            setItems(loadedItems);
+            if (liveUnknown) {
+                flash('Steam did not report current options — showing saved state', '#e8a33d');
+            }
+        }).catch((e) => {
             console.error('[launch-options-manager] load failed', e);
             setItems([]);
             flash('Failed to read launch options', C.red);
         });
-        return () => { if (applyTimer.current) clearTimeout(applyTimer.current); };
+        return () => {
+            if (applyTimer.current) clearTimeout(applyTimer.current);
+            applyTimer.current = null;
+            if (pendingItems.current) {
+                const next = pendingItems.current;
+                pendingItems.current = null;
+                const composed = composeLaunchOptions(next);
+                setGameItems(appid, next, composed);
+                setLaunchOptions(appid, composed);
+            }
+            flushStore();
+        };
     }, [appid]);
 
     const flash = (msg: string, color = C.muted) => {
@@ -149,19 +172,23 @@ export function ManagerWindow({ appid }: { appid: number }) {
     // Persist + push to Steam, debounced so typing doesn't write partial args.
     const update = (next: ArgItem[], immediate = false) => {
         setItems(next);
+        pendingItems.current = next;
         if (applyTimer.current) clearTimeout(applyTimer.current);
         const run = async () => {
             applyTimer.current = null;
+            pendingItems.current = null;
+            const seq = ++runSeq.current;
             const composed = composeLaunchOptions(next);
             setGameItems(appid, next, composed);
             flash('Applying…', C.muted);
             try {
                 const verified = await setAndVerifyLaunchOptions(appid, composed);
+                if (seq !== runSeq.current) return; // superseded by a newer apply
                 if (verified) flash('✓ Applied', C.green);
                 else flash('Sent, but Steam did not confirm — check the Properties dialog', '#e8a33d');
             } catch (e) {
                 console.error('[launch-options-manager] apply failed', e);
-                flash('Could not apply — SteamClient API unavailable', C.red);
+                if (seq === runSeq.current) flash('Could not apply — SteamClient API unavailable', C.red);
             }
         };
         if (immediate) run();
@@ -169,6 +196,16 @@ export function ManagerWindow({ appid }: { appid: number }) {
             flash('…', C.muted);
             applyTimer.current = setTimeout(run, 600);
         }
+    };
+
+    // Replace the editor state without re-applying (the caller already wrote
+    // to Steam) — used when bulk apply targets the game that is open here.
+    const adoptItems = (next: ArgItem[]) => {
+        if (applyTimer.current) clearTimeout(applyTimer.current);
+        applyTimer.current = null;
+        pendingItems.current = null;
+        runSeq.current++;
+        setItems(next);
     };
 
     if (items === null) {
@@ -235,17 +272,18 @@ export function ManagerWindow({ appid }: { appid: number }) {
                         onChange={changeItem} onDelete={deleteItem} onMove={moveItem} onAdd={addItem} />
                 )}
                 {tab === 'presets' && (
-                    <PresetsTab onAdd={(p) => { addItem(p.kind, p.text); flash(`Added: ${p.text}`, C.green); }} />
+                    <PresetsTab hasRaw={hasRaw}
+                        onAdd={(p) => { addItem(p.kind, p.text); flash(`Added: ${p.text}`, C.green); }} />
                 )}
                 {tab === 'profiles' && (
-                    <ProfilesTab items={items} flash={flash}
+                    <ProfilesTab items={items} flash={flash} hasRaw={hasRaw}
                         onLoad={(profileItems, replace) => {
                             const copies = profileItems.map((it) => ({ ...makeItem(it.kind, it.text, it.enabled) }));
                             update(replace ? copies : [...items, ...copies], true);
                             setTab('args');
                         }} />
                 )}
-                {tab === 'bulk' && <BulkTab flash={flash} />}
+                {tab === 'bulk' && <BulkTab flash={flash} currentAppid={appid} onAppliedToCurrent={adoptItems} />}
             </div>
             <div style={S.preview}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
@@ -255,9 +293,20 @@ export function ManagerWindow({ appid }: { appid: number }) {
                     <button
                         style={{ ...S.iconBtn, marginLeft: 'auto' }}
                         title="Copy to clipboard"
-                        onClick={() => {
-                            try { navigator.clipboard?.writeText(composed); flash('Copied', C.green); }
-                            catch { flash('Copy failed — select the text manually', C.red); }
+                        onClick={(e) => {
+                            // Must use the popout window's navigator: the
+                            // SharedJSContext global has no document focus and
+                            // its clipboard writes are rejected.
+                            const win = (e.currentTarget as HTMLElement).ownerDocument?.defaultView;
+                            const clipboard = win?.navigator?.clipboard;
+                            if (!clipboard) {
+                                flash('Copy failed — select the text manually', C.red);
+                                return;
+                            }
+                            clipboard.writeText(composed).then(
+                                () => flash('Copied', C.green),
+                                () => flash('Copy failed — select the text manually', C.red),
+                            );
                         }}
                     >⧉ copy</button>
                 </div>
@@ -283,8 +332,9 @@ function ArgsTab(props: {
         return (
             <div>
                 <div style={{ ...S.section, color: C.muted, lineHeight: 1.5 }}>
-                    These launch options use shell constructs (pipes, quoting around %command%, …) that can't be
-                    split into separate toggles, so they're edited as one block. Clear the text to start structured editing.
+                    These launch options use shell constructs (pipes, escapes, quoting around %command%, …) that
+                    can't be split into separate toggles, so they're edited as one block. Presets and profile
+                    merging are unavailable in this mode.
                 </div>
                 <div style={{ ...S.row, alignItems: 'stretch' }}>
                     <MiniToggle value={raw.enabled} onChange={(v) => onChange(raw.id, { enabled: v }, true)} />
@@ -294,8 +344,12 @@ function ArgsTab(props: {
                         spellCheck={false}
                         onChange={(e) => onChange(raw.id, { text: (e.target as HTMLTextAreaElement).value })}
                     />
-                    <button style={{ ...S.iconBtn, color: C.red }} title="Remove" onClick={() => onDelete(raw.id)}>✕</button>
                 </div>
+                <button
+                    style={{ ...S.smallBtn, marginTop: '8px', color: C.red }}
+                    title="Removes the raw block (clears the game's launch options) and enables the structured editor"
+                    onClick={() => onDelete(raw.id)}
+                >Discard and switch to structured editing</button>
             </div>
         );
     }
@@ -322,13 +376,23 @@ function ArgsTab(props: {
     );
 }
 
-function PresetsTab({ onAdd }: { onAdd: (p: Preset) => void }) {
+function PresetsTab({ onAdd, hasRaw }: { onAdd: (p: Preset) => void; hasRaw: boolean }) {
     const [filter, setFilter] = useState('');
     const lower = filter.toLowerCase();
     const visible = PRESETS.filter(
         (p) => !lower || p.text.toLowerCase().includes(lower) || p.description.toLowerCase().includes(lower),
     );
     const categories = [...new Set(visible.map((p) => p.category))];
+
+    if (hasRaw) {
+        return (
+            <div style={{ color: C.muted, lineHeight: 1.6 }}>
+                This game's launch options are in raw mode (shell constructs that can't be split into toggles), so
+                presets can't be added — they would be ignored by the raw string. Switch to structured editing on
+                the Arguments tab first.
+            </div>
+        );
+    }
 
     return (
         <div>
@@ -359,10 +423,11 @@ function PresetsTab({ onAdd }: { onAdd: (p: Preset) => void }) {
 
 function ProfilesTab(props: {
     items: ArgItem[];
+    hasRaw: boolean;
     flash: (msg: string, color?: string) => void;
     onLoad: (items: ArgItem[], replace: boolean) => void;
 }) {
-    const { items, flash, onLoad } = props;
+    const { items, hasRaw, flash, onLoad } = props;
     const [name, setName] = useState('');
     const [, bump] = useState(0);
     const profiles = getProfiles();
@@ -403,8 +468,13 @@ function ProfilesTab(props: {
                         </div>
                         <button style={S.smallBtn} title="Replace this game's arguments with the profile"
                             onClick={() => onLoad(p.items, true)}>Load</button>
-                        <button style={S.smallBtn} title="Add the profile's arguments on top of the current ones"
-                            onClick={() => onLoad(p.items, false)}>+ Merge</button>
+                        <button
+                            style={{ ...S.smallBtn, ...(hasRaw ? { opacity: 0.4, cursor: 'default' } : {}) }}
+                            disabled={hasRaw}
+                            title={hasRaw
+                                ? 'Unavailable in raw mode — merged items would be ignored by the raw string'
+                                : "Add the profile's arguments on top of the current ones"}
+                            onClick={() => { if (!hasRaw) onLoad(p.items, false); }}>+ Merge</button>
                         <button style={{ ...S.iconBtn, color: C.red }} title="Delete profile"
                             onClick={() => { deleteProfile(p.name); bump((n) => n + 1); }}>✕</button>
                     </div>
@@ -414,7 +484,12 @@ function ProfilesTab(props: {
     );
 }
 
-function BulkTab({ flash }: { flash: (msg: string, color?: string) => void }) {
+function BulkTab(props: {
+    flash: (msg: string, color?: string) => void;
+    currentAppid: number;
+    onAppliedToCurrent: (items: ArgItem[]) => void;
+}) {
+    const { flash, currentAppid, onAppliedToCurrent } = props;
     const [profileName, setProfileName] = useState('');
     const [filter, setFilter] = useState('');
     const [selected, setSelected] = useState<Set<number>>(new Set());
@@ -441,8 +516,12 @@ function BulkTab({ flash }: { flash: (msg: string, color?: string) => void }) {
             if (setLaunchOptions(appid, composed)) {
                 setGameItems(appid, copies, composed);
                 ok++;
+                // The Arguments tab still holds this game's old items; sync it
+                // or its next debounced apply would revert what we just wrote.
+                if (appid === currentAppid) onAppliedToCurrent(copies);
             }
         }
+        flushStore();
         flash(`Profile applied to ${ok} game${ok === 1 ? '' : 's'}`, C.green);
         setSelected(new Set());
     };

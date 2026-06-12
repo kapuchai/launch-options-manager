@@ -10,6 +10,10 @@ const backendSetStore = callable<[{ a_json: string }], boolean>('SetStore');
 
 let store: Store = emptyStore();
 let loaded = false;
+// When the existing store file couldn't be read/understood, refuse all writes:
+// otherwise the first routine save would replace the user's real data with an
+// empty store plus one edit.
+let loadFailed = false;
 
 export async function loadStore(): Promise<Store> {
     if (loaded) return store;
@@ -17,26 +21,59 @@ export async function loadStore(): Promise<Store> {
         const raw = await backendGetStore();
         if (raw && raw.trim()) {
             const parsed = JSON.parse(raw);
-            if (parsed && parsed.version === 1) store = parsed;
+            if (parsed && parsed.version === 1) {
+                store = {
+                    version: 1,
+                    games: parsed.games && typeof parsed.games === 'object' && !Array.isArray(parsed.games) ? parsed.games : {},
+                    profiles: Array.isArray(parsed.profiles) ? parsed.profiles : [],
+                };
+            } else {
+                console.error('[launch-options-manager] Store has unknown version — refusing to overwrite it', parsed?.version);
+                loadFailed = true;
+            }
         }
     } catch (e) {
-        console.error('[launch-options-manager] Failed to load store, starting empty', e);
+        console.error('[launch-options-manager] Failed to load store — persistence disabled to protect the file', e);
+        loadFailed = true;
     }
     loaded = true;
     return store;
 }
 
 let saveTimer: any = null;
+
+async function doSave(): Promise<boolean> {
+    if (loadFailed) {
+        console.error('[launch-options-manager] Not persisting: the store failed to load this session');
+        return false;
+    }
+    try {
+        const res: any = await backendSetStore({ a_json: JSON.stringify(store, null, 2) });
+        const ok = res === true || res === 'true';
+        if (!ok) console.error('[launch-options-manager] Backend failed to persist the store (disk full / permissions?)');
+        return ok;
+    } catch (e) {
+        console.error('[launch-options-manager] Failed to save store', e);
+        return false;
+    }
+}
+
 export function saveStore(): void {
     if (saveTimer) clearTimeout(saveTimer);
-    saveTimer = setTimeout(async () => {
+    saveTimer = setTimeout(() => {
         saveTimer = null;
-        try {
-            await backendSetStore({ a_json: JSON.stringify(store, null, 2) });
-        } catch (e) {
-            console.error('[launch-options-manager] Failed to save store', e);
-        }
+        doSave();
     }, 400);
+}
+
+// Immediate write, used for discrete actions (profile save/delete, bulk apply)
+// and teardown paths where the debounce window would lose data.
+export function flushStore(): void {
+    if (saveTimer) {
+        clearTimeout(saveTimer);
+        saveTimer = null;
+    }
+    doSave();
 }
 
 export function getStore(): Store {
@@ -72,6 +109,11 @@ function waitForAppDetails(appid: number, timeoutMs: number, predicate?: (d: any
                     finish(details);
                 }
             });
+            // If the callback fired synchronously, finish() ran before reg was
+            // assigned and could not unregister — release it now.
+            if (done) {
+                try { reg?.unregister?.(); } catch { /* ignore */ }
+            }
         } catch (e) {
             console.error('[launch-options-manager] RegisterForAppDetails failed', e);
             finish(appDetailsStore?.GetAppDetails?.(appid) ?? null);
@@ -90,9 +132,11 @@ function readOptionsFromDetails(details: any): string {
     return details.strLaunchOptions ?? '';
 }
 
-export async function getLiveLaunchOptions(appid: number): Promise<string> {
+// null = the read failed (details never loaded) — distinct from a confirmed
+// empty launch-options string.
+export async function getLiveLaunchOptions(appid: number): Promise<string | null> {
     const details = await waitForAppDetails(appid, 1500);
-    return readOptionsFromDetails(details);
+    return details ? readOptionsFromDetails(details) : null;
 }
 
 export function setLaunchOptions(appid: number, options: string): boolean {
@@ -119,7 +163,7 @@ export function setLaunchOptions(appid: number, options: string): boolean {
 export async function setAndVerifyLaunchOptions(appid: number, options: string): Promise<boolean> {
     if (!setLaunchOptions(appid, options)) return false;
     const details = await waitForAppDetails(appid, 1200, (d) => readOptionsFromDetails(d).trim() === options.trim());
-    return readOptionsFromDetails(details).trim() === options.trim();
+    return details !== null && readOptionsFromDetails(details).trim() === options.trim();
 }
 
 export interface GameEntry {
@@ -160,14 +204,24 @@ export function getGameName(appid: number): string {
 
 // ── Per-game config ─────────────────────────────────────────────────────────
 
+export interface GameLoad {
+    items: ArgItem[];
+    // True when Steam never delivered app details — the items come from the
+    // plugin store alone and must not be reconciled against a phantom ''.
+    liveUnknown: boolean;
+}
+
 // Load the item list for a game, reconciling stored state with whatever is
 // currently set in Steam (the user may have edited options in the vanilla UI).
-export async function getGameItems(appid: number): Promise<ArgItem[]> {
+export async function getGameItems(appid: number): Promise<GameLoad> {
     await loadStore();
     const key = String(appid);
     const cfg = store.games[key];
     const live = await getLiveLaunchOptions(appid);
-    return reconcile(cfg?.items, cfg?.lastApplied, live);
+    if (live === null) {
+        return { items: cfg?.items ?? [], liveUnknown: true };
+    }
+    return { items: reconcile(cfg?.items, cfg?.lastApplied, live), liveUnknown: false };
 }
 
 export function setGameItems(appid: number, items: ArgItem[], applied: string): void {
@@ -195,10 +249,10 @@ export function saveProfile(name: string, items: ArgItem[]): void {
     } else {
         store.profiles.push({ name, items: copy });
     }
-    saveStore();
+    flushStore();
 }
 
 export function deleteProfile(name: string): void {
     store.profiles = store.profiles.filter((p) => p.name !== name);
-    saveStore();
+    flushStore();
 }

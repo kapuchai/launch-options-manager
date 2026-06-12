@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { DialogButton, IconsModule, Millennium, definePlugin, findModule, showModal } from '@steambrew/client';
 import { ManagerWindow } from './manager';
 import { composeLaunchOptions } from './model';
-import { getGameName, getStore, loadStore } from './store';
+import { flushStore, getGameName, getStore, loadStore } from './store';
 
 declare const uiStore: any;
 
@@ -76,7 +76,8 @@ async function watchPropertiesDialog(popup: any) {
     const appid = parseInt(match[1], 10);
 
     const tryInject = () => {
-        if (panel.id.endsWith('/properties/general_Content')) {
+        // general = regular games; shortcut = non-Steam games' equivalent page
+        if (/\/properties\/(general|shortcut)_Content$/.test(panel.id)) {
             injectPropertiesButton(popup, panel, appid).catch((e) =>
                 console.error('[launch-options-manager] properties inject failed', e));
         }
@@ -86,6 +87,10 @@ async function watchPropertiesDialog(popup: any) {
 }
 
 // ── window plumbing ─────────────────────────────────────────────────────────
+
+// Browsers we already attached a navigation listener to; the main window can
+// be re-created (close to tray → reopen), re-firing the create hook.
+const boundBrowsers = new WeakSet<object>();
 
 async function OnPopupCreation(popup: any) {
     if (popup.m_strName === 'SP Desktop_uid0') {
@@ -97,9 +102,13 @@ async function OnPopupCreation(popup: any) {
             mwbm = (window as any).MainWindowBrowserManager;
             if (!mwbm) await new Promise((r) => setTimeout(r, 200));
         }
+        if (boundBrowsers.has(mwbm.m_browser)) return;
+        boundBrowsers.add(mwbm.m_browser);
         mwbm.m_browser.on('finished-request', () => {
             if (mwbm.m_lastLocation.pathname.startsWith('/library/app/')) {
-                injectAppPageButton(popup).catch((e) =>
+                // use the current main window popup, not the captured one —
+                // the listener can outlive a re-created window
+                injectAppPageButton(mainWindowPopup ?? popup).catch((e) =>
                     console.error('[launch-options-manager] app page inject failed', e));
             }
         });
@@ -138,10 +147,14 @@ export default definePlugin(() => {
     console.log('[launch-options-manager] frontend startup');
     loadStore().catch((e) => console.error('[launch-options-manager] store preload failed', e));
     Millennium.AddWindowCreateHook!(OnPopupCreation);
+    // Flush any debounced store write on Steam shutdown; the IPC message is
+    // posted synchronously, so it survives teardown without awaiting.
+    window.addEventListener('beforeunload', () => flushStore());
 
     return {
         title: 'Launch Options Manager',
         icon: <IconsModule.Settings />,
         content: <SettingsContent />,
+        onDismount: () => flushStore(),
     };
 });
