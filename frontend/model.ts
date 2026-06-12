@@ -31,7 +31,7 @@ export interface Profile {
     items: ArgItem[];
 }
 
-export type GpuVendor = 'auto' | 'amd' | 'nvidia';
+export type GpuVendor = 'auto' | 'amd' | 'nvidia' | 'off';
 
 export interface UISettings {
     showAppButton: boolean;

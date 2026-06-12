@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Field, IconsModule, Millennium, Toggle, definePlugin, findModule, showModal, sleep } from '@steambrew/client';
 import { ManagerWindow } from './manager';
 import { composeLaunchOptions } from './model';
-import { flushStore, getGameName, getStore, getUISettings, loadStore, persistenceBlocked, updateUISettings } from './store';
+import { flushStore, getGameName, getStore, getUISettings, loadStore, persistenceBlocked, restoreBackup, updateUISettings } from './store';
 import { getMainWindowPopup, setMainWindowPopup } from './windows';
 
 declare const uiStore: any;
@@ -219,13 +219,25 @@ async function applySteamMenuItem(popup: any) {
         return;
     }
     if (existing) return;
-    const menuItems = await WaitForElementList("div#popup_target div[role='menuitem']", doc, 3000);
-    if (!menuItems.length || doc.querySelector('.lom-menu-item')) return;
+    // NO timeout here: the popup is created hidden at boot and its menu items
+    // only render when the menu is first opened — a timed wait expires hours
+    // before that. (This exact mistake shipped once; librarian waits forever.)
+    const menuItems = [...(await Millennium.findElement(doc, "div#popup_target div[role='menuitem']"))] as HTMLElement[];
+    // the boot-time waiter can resolve hours later — the setting may have
+    // been turned off in the meantime
+    if (!getUISettings().showSteamMenuItem || !menuItems.length || doc.querySelector('.lom-menu-item')) return;
+    // prefer sitting right below the Settings entry; fall back to above Exit
+    const settingsItem = menuItems.find((el) => /^settings$/i.test(el.textContent?.trim() ?? ''));
     const exitItem = menuItems[menuItems.length - 1];
-    const item = exitItem.cloneNode(true) as HTMLElement;
+    const template = settingsItem ?? exitItem;
+    const item = template.cloneNode(true) as HTMLElement;
     item.classList.add('lom-menu-item');
     item.textContent = 'Launch Options';
-    exitItem.parentNode!.insertBefore(item, exitItem);
+    if (settingsItem?.parentNode) {
+        settingsItem.parentNode.insertBefore(item, settingsItem.nextSibling);
+    } else {
+        exitItem.parentNode!.insertBefore(item, exitItem);
+    }
     item.addEventListener('click', () => openManager(getMainWindowPopup(), 0));
 }
 
@@ -234,6 +246,8 @@ async function applySteamMenuItem(popup: any) {
 function SettingsContent() {
     const [ready, setReady] = useState(false);
     const [accentDraft, setAccentDraft] = useState('');
+    const [restoreState, setRestoreState] = useState<'idle' | 'confirm' | 'working' | 'done' | 'failed'>('idle');
+    const [restoreMsg, setRestoreMsg] = useState('');
     const [, bump] = useState(0);
     useEffect(() => {
         loadStore().then(() => {
@@ -285,9 +299,9 @@ function SettingsContent() {
             <Field label="Steam menu entry" description="Add 'Launch Options' to the top-left Steam menu (opens profiles & bulk apply)" bottomSeparator="standard" focusable>
                 <Toggle value={ui.showSteamMenuItem} onChange={(v: boolean) => setUI({ showSteamMenuItem: v })} />
             </Field>
-            <Field label="GPU vendor" description="Used to gray out presets meant for the other vendor; Auto probes the installed drivers" bottomSeparator="standard" focusable>
+            <Field label="GPU vendor" description="Grays out presets meant for the other vendor; Auto probes the drivers, Disabled turns the hints off" bottomSeparator="standard" focusable>
                 <div style={{ display: 'flex', gap: '6px' }}>
-                    {([['auto', 'Auto-detect'], ['amd', 'AMD'], ['nvidia', 'NVIDIA']] as const).map(([value, label]) => (
+                    {([['auto', 'Auto-detect'], ['amd', 'AMD'], ['nvidia', 'NVIDIA'], ['off', 'Disabled']] as const).map(([value, label]) => (
                         <button key={value} style={pillStyle(ui.gpuVendor === value)}
                             onClick={() => setUI({ gpuVendor: value })}>{label}</button>
                     ))}
@@ -316,6 +330,28 @@ function SettingsContent() {
                         }}
                     />
                     {!accentValid && <span style={{ color: '#f04a4a', fontSize: '11px' }}>invalid hex</span>}
+                </div>
+            </Field>
+            <Field label="Restore from backup" description="Swap the plugin's data file with its previous generation (lom-store.json.bak). Running it again swaps back." bottomSeparator="standard" focusable>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <button
+                        style={pillStyle(restoreState === 'confirm')}
+                        onClick={async () => {
+                            if (restoreState === 'working') return;
+                            if (restoreState !== 'confirm') {
+                                setRestoreState('confirm');
+                                setRestoreMsg('');
+                                setTimeout(() => setRestoreState((st) => (st === 'confirm' ? 'idle' : st)), 4000);
+                                return;
+                            }
+                            setRestoreState('working');
+                            const res = await restoreBackup();
+                            setRestoreState(res.ok ? 'done' : 'failed');
+                            setRestoreMsg(res.ok ? 'Restored — previous state is now the backup' : `Failed: ${res.reason}`);
+                            bump((n) => n + 1);
+                        }}
+                    >{restoreState === 'confirm' ? 'Click again to confirm' : restoreState === 'working' ? 'Restoring…' : 'Restore'}</button>
+                    {restoreMsg && <span style={{ fontSize: '12px', color: restoreState === 'failed' ? '#f04a4a' : '#24a65a' }}>{restoreMsg}</span>}
                 </div>
             </Field>
             <p style={{ opacity: 0.7 }}>

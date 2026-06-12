@@ -9,6 +9,9 @@ declare const collectionStore: any;
 const backendGetStore = callable<[], string>('GetStore');
 const backendSetStore = callable<[{ a_json: string }], string>('SetStore');
 const backendGetCapabilities = callable<[], string>('GetCapabilities');
+const backendExportProfiles = callable<[{ a_json: string }], string>('ExportProfiles');
+const backendReadProfilesFile = callable<[], string>('ReadProfilesFile');
+const backendRestoreBackup = callable<[], string>('RestoreBackup');
 
 let store: Store = emptyStore();
 // When the existing store file couldn't be read/understood, refuse all writes:
@@ -164,12 +167,12 @@ export function saveStore(): void {
 
 // Immediate write, used for discrete actions (profile save/delete, bulk apply)
 // and teardown paths where the debounce window would lose data.
-export function flushStore(): void {
+export function flushStore(): Promise<boolean> {
     if (saveTimer) {
         clearTimeout(saveTimer);
         saveTimer = null;
     }
-    doSave();
+    return doSave();
 }
 
 export function getStore(): Store {
@@ -356,6 +359,157 @@ export function saveProfile(name: string, items: ArgItem[]): void {
 export function deleteProfile(name: string): void {
     store.profiles = store.profiles.filter((p) => p.name !== name);
     flushStore();
+}
+
+// ── ProtonDB community reports ──────────────────────────────────────────────
+
+const backendGetProtonDB = callable<[{ a_appid: number }], string>('GetProtonDBReports');
+
+export interface PDBGroup {
+    lo: string;          // the launch options string
+    count: number;       // how many reports used it
+    latest: number;      // newest report timestamp (s)
+    protons: string[];   // proton versions seen with it (most recent first)
+}
+
+export interface PDBResult {
+    groups: PDBGroup[];
+    totalReports: number;
+    error?: string;
+}
+
+const pdbCache = new Map<number, PDBResult>();
+
+export async function fetchProtonDBReports(appid: number): Promise<PDBResult> {
+    const cached = pdbCache.get(appid);
+    if (cached && !cached.error) return cached;
+    let result: PDBResult;
+    try {
+        const parsed = JSON.parse(String(await backendGetProtonDB({ a_appid: appid })));
+        if (parsed.__error) {
+            result = { groups: [], totalReports: 0, error: String(parsed.__error) };
+        } else {
+            const reports: any[] = Array.isArray(parsed.reports) ? parsed.reports : [];
+            const byText = new Map<string, PDBGroup & { protonSet: Set<string> }>();
+            for (const r of reports) {
+                const lo = String(r.lo ?? '').trim();
+                if (!lo) continue;
+                let g = byText.get(lo);
+                if (!g) {
+                    g = { lo, count: 0, latest: 0, protons: [], protonSet: new Set() };
+                    byText.set(lo, g);
+                }
+                g.count++;
+                if (r.ts > g.latest) g.latest = r.ts;
+                if (r.proton) g.protonSet.add(String(r.proton));
+            }
+            const groups = [...byText.values()]
+                .map((g) => ({ lo: g.lo, count: g.count, latest: g.latest, protons: [...g.protonSet].slice(0, 3) }))
+                .sort((a, b) => b.count - a.count || b.latest - a.latest);
+            result = { groups, totalReports: Number(parsed.total ?? reports.length) };
+        }
+    } catch (e) {
+        console.error('[launch-options-manager] ProtonDB fetch failed', e);
+        result = { groups: [], totalReports: 0, error: 'request failed' };
+    }
+    pdbCache.set(appid, result);
+    return result;
+}
+
+// ── Profile export / import / backup restore ───────────────────────────────
+
+export interface ExportResult { ok: boolean; path?: string; }
+
+export async function exportProfiles(): Promise<ExportResult> {
+    // with a failed store load the in-memory profile list is empty — writing
+    // it out would clobber a possibly-good previous export with nothing
+    if (persistenceBlocked() || !store.profiles.length) return { ok: false };
+    try {
+        const payload = JSON.stringify({ launchOptionsManagerProfiles: 1, profiles: store.profiles }, null, 2);
+        const res = JSON.parse(String(await backendExportProfiles({ a_json: payload })));
+        return { ok: res?.ok === true, path: res?.path };
+    } catch (e) {
+        console.error('[launch-options-manager] export failed', e);
+        return { ok: false };
+    }
+}
+
+export interface ImportResult { ok: boolean; added: number; renamed: number; skipped: number; error?: string; }
+
+export async function importProfiles(): Promise<ImportResult> {
+    const fail = (error: string): ImportResult => ({ ok: false, added: 0, renamed: 0, skipped: 0, error });
+    try {
+        const raw = String(await backendReadProfilesFile());
+        const parsed = JSON.parse(raw);
+        if (parsed?.__missing) return fail(`no file found — place it at ${parsed.path ?? 'the plugin directory'}`);
+        if (parsed?.__readError) return fail('the profiles file could not be read');
+        const incoming: Profile[] = Array.isArray(parsed) ? parsed : parsed?.profiles;
+        if (!Array.isArray(incoming)) return fail('not a profiles export (expected { profiles: [...] })');
+        if (persistenceBlocked()) return fail('the plugin store failed to load — imports cannot be saved (try Restore from backup first)');
+
+        let added = 0;
+        let renamed = 0;
+        let skipped = 0;
+        for (const prof of incoming) {
+            if (!prof || typeof prof.name !== 'string' || !Array.isArray(prof.items)) continue;
+            const items: ArgItem[] = prof.items
+                .filter((it: any) => it && typeof it.text === 'string' && ['env', 'wrapper', 'flag', 'raw'].includes(it.kind))
+                .map((it: any) => ({ ...makeItem(it.kind, it.text, it.enabled !== false), note: typeof it.note === 'string' ? it.note : undefined }));
+            const compose = (p: { items: ArgItem[] }) => p.items.map((i) => `${i.kind}:${i.enabled}:${i.text.trim()}`).join('|');
+            const existing = store.profiles.find((p) => p.name === prof.name);
+            if (existing && compose(existing) === compose({ items })) {
+                skipped++;
+                continue;
+            }
+            let name = prof.name;
+            if (existing) {
+                let n = 2;
+                name = `${prof.name} (imported)`;
+                while (store.profiles.some((p) => p.name === name)) name = `${prof.name} (imported ${n++})`;
+                renamed++;
+            } else {
+                added++;
+            }
+            store.profiles.push({ name, items });
+        }
+        const saved = await flushStore();
+        if (!saved) return fail('profiles were imported but could not be saved to disk');
+        return { ok: true, added, renamed, skipped };
+    } catch (e) {
+        console.error('[launch-options-manager] import failed', e);
+        return fail('the file is not valid JSON');
+    }
+}
+
+// Bumped whenever the in-memory store is rebuilt from disk (restore); open
+// manager windows use it to refuse writing their now-stale state back.
+let storeGeneration = 0;
+export function getStoreGeneration(): number {
+    return storeGeneration;
+}
+
+// Swap live store with .bak on disk, then rebuild the in-memory state.
+export async function restoreBackup(): Promise<{ ok: boolean; reason?: string }> {
+    // a pending debounced save would re-serialize the pre-restore state right
+    // over the restored file — discard it
+    if (saveTimer) {
+        clearTimeout(saveTimer);
+        saveTimer = null;
+    }
+    try {
+        const res = JSON.parse(String(await backendRestoreBackup()));
+        if (res?.ok !== true) return { ok: false, reason: res?.reason ?? 'unknown error' };
+        store = emptyStore();
+        loadFailed = false;
+        loadPromise = null;
+        capsPromise = null;
+        storeGeneration++;
+        await loadStore();
+        return { ok: true };
+    } catch (e) {
+        console.error('[launch-options-manager] restore failed', e);
+        return { ok: false, reason: 'backend call failed' };
+    }
 }
 
 // ── UI settings ─────────────────────────────────────────────────────────────

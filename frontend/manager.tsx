@@ -1,9 +1,10 @@
 import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { DialogButton } from '@steambrew/client';
-import { ArgItem, ArgKind, GpuVendor, composeLaunchOptions, detectConflicts, makeItem, tokenize } from './model';
+import { ArgItem, ArgKind, GpuVendor, composeLaunchOptions, detectConflicts, makeItem, parseLaunchOptions, tokenize } from './model';
 import { PRESETS, Preset } from './presets';
 import {
     Capabilities,
+    getStoreGeneration,
     GameEntry,
     flushStore,
     getAllGames,
@@ -14,6 +15,10 @@ import {
     getUISettings,
     getUserCollections,
     deleteProfile,
+    exportProfiles,
+    fetchProtonDBReports,
+    importProfiles,
+    PDBResult,
     isShortcut,
     loadStore,
     onSaveFailure,
@@ -42,6 +47,7 @@ interface Palette {
     input: string;
     header: string;
     accentHover: string;
+    accentDim: string;
 }
 
 interface PaletteExtra {
@@ -51,7 +57,7 @@ interface PaletteExtra {
 }
 
 const FALLBACK: Palette & PaletteExtra = {
-    bg: '#1e242c',
+    bg: '#1a2027',
     panel: '#28303a',
     panelHover: '#2f3845',
     border: 'rgba(255,255,255,0.09)',
@@ -65,14 +71,32 @@ const FALLBACK: Palette & PaletteExtra = {
     input: '#161b21',
     header: '#2f3845',
     accentHover: '#3eb1ff',
+    accentDim: 'rgb(17, 104, 167)',
 };
 
-// '#rrggbb' → lightened toward white by `amount` (0..1)
-function lighten(hex: string, amount: number): string {
-    const m = hex.match(/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i);
-    if (!m) return hex;
-    const mix = (c: string) => Math.min(255, Math.round(parseInt(c, 16) * (1 - amount) + 255 * amount));
-    return `rgb(${mix(m[1])}, ${mix(m[2])}, ${mix(m[3])})`;
+// parse '#rrggbb' or 'rgb(r, g, b)' into channels
+function parseColor(color: string): [number, number, number] | null {
+    const hex = color.match(/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i);
+    if (hex) return [parseInt(hex[1], 16), parseInt(hex[2], 16), parseInt(hex[3], 16)];
+    const rgb = color.match(/^rgb\((\d+),\s*(\d+),\s*(\d+)\)$/);
+    if (rgb) return [Number(rgb[1]), Number(rgb[2]), Number(rgb[3])];
+    return null;
+}
+
+function lighten(color: string, amount: number): string {
+    const c = parseColor(color);
+    if (!c) return color;
+    const mix = (v: number) => Math.min(255, Math.round(v * (1 - amount) + 255 * amount));
+    return `rgb(${mix(c[0])}, ${mix(c[1])}, ${mix(c[2])})`;
+}
+
+// toward black — filled elements (toggles, active pills/tabs) use a dimmed
+// accent: a solid block of the raw accent reads much harsher than text
+function darken(color: string, amount: number): string {
+    const c = parseColor(color);
+    if (!c) return color;
+    const mix = (v: number) => Math.round(v * (1 - amount));
+    return `rgb(${mix(c[0])}, ${mix(c[1])}, ${mix(c[2])})`;
 }
 
 // Adapt to the active Millennium theme: SpaceTheme (and themes following its
@@ -97,7 +121,7 @@ function readPalette(doc: Document, accentOverride?: string): Palette {
             // everything; the lighter grays color-2/5 are the visible
             // surfaces, so the manager builds on those.
             palette = {
-                bg: rgb('--st-color-2', FALLBACK.bg),
+                bg: rgb('--st-color-4', FALLBACK.bg),
                 panel: rgb('--st-color-5', FALLBACK.panel),
                 panelHover: rgb('--st-color-6', FALLBACK.panelHover),
                 border: 'rgba(255,255,255,0.09)',
@@ -111,12 +135,14 @@ function readPalette(doc: Document, accentOverride?: string): Palette {
                 mono: FALLBACK.mono,
                 input: rgb('--st-color-1', FALLBACK.input),
                 header: rgb('--st-color-6', FALLBACK.header),
+                accentDim: '',
             };
         }
     } catch { /* fall through to fallback */ }
     if (accentOverride && /^#[0-9a-f]{6}$/i.test(accentOverride)) {
-        palette = { ...palette, accent: accentOverride, accentHover: lighten(accentOverride, 0.18) };
+        palette = { ...palette, accent: accentOverride, accentHover: lighten(accentOverride, 0.18), accentDim: '' };
     }
+    if (!palette.accentDim) palette = { ...palette, accentDim: darken(palette.accent, 0.3) };
     return palette;
 }
 
@@ -126,9 +152,9 @@ function makeStyles(C: Palette): Record<string, React.CSSProperties> {
             display: 'flex', flexDirection: 'column', height: '100%', minHeight: '560px',
             background: C.bg, color: C.text, fontSize: '13px',
         },
-        tabBar: { display: 'flex', gap: '2px', padding: '8px 12px 0 12px', borderBottom: `1px solid ${C.border}`, flexShrink: 0 },
-        tab: { padding: '7px 14px', cursor: 'pointer', borderRadius: '8px 8px 0 0', color: C.muted, userSelect: 'none' },
-        tabActive: { background: C.panel, color: C.text, boxShadow: `inset 0 2px 0 ${C.accent}` },
+        tabBar: { display: 'flex', gap: '6px', padding: '10px 14px', flexShrink: 0 },
+        tab: { padding: '6px 16px', cursor: 'pointer', borderRadius: '14px', color: C.muted, userSelect: 'none', border: '1px solid transparent' },
+        tabActive: { background: C.accentDim, color: '#fff' },
         body: { flex: 1, overflowY: 'auto', padding: '12px 16px' },
         section: { marginBottom: '16px' },
         sectionTitle: { fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.08em', color: C.muted, margin: '0 0 6px 2px' },
@@ -150,7 +176,7 @@ function makeStyles(C: Palette): Record<string, React.CSSProperties> {
             padding: '6px 10px', borderRadius: '8px', fontSize: '12px', width: '100%', textAlign: 'left',
         },
         preview: {
-            flexShrink: 0, borderTop: `2px solid ${C.accent}`, padding: '10px 16px 12px 16px',
+            flexShrink: 0, borderTop: `2px solid ${C.accentDim}`, padding: '10px 16px 12px 16px',
             display: 'flex', flexDirection: 'column', gap: '5px', background: C.panel,
         },
         previewText: {
@@ -164,8 +190,8 @@ function makeStyles(C: Palette): Record<string, React.CSSProperties> {
             padding: '4px 12px', borderRadius: '8px', fontSize: '12px',
         },
         badge: {
-            fontSize: '10px', padding: '1px 6px', borderRadius: '8px', whiteSpace: 'nowrap',
-            border: `1px solid ${C.border}`, color: C.muted,
+            fontSize: '10px', padding: '2px 8px', borderRadius: '8px', whiteSpace: 'nowrap',
+            background: C.header, border: '1px solid rgba(255,255,255,0.16)', color: C.text,
         },
         catHeader: {
             display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', userSelect: 'none',
@@ -182,7 +208,7 @@ function makeStyles(C: Palette): Record<string, React.CSSProperties> {
             padding: '4px 12px', borderRadius: '14px', fontSize: '12px',
         },
         pillActive: {
-            background: C.accent, color: '#fff', border: `1px solid ${C.accent}`,
+            background: C.accentDim, color: '#fff', border: `1px solid ${C.accentDim}`,
         },
     };
 }
@@ -204,6 +230,7 @@ function paletteCss(C: Palette): string {
 .lom-root select option { background-color: ${C.panel}; color: ${C.text}; }
 .lom-root input::placeholder, .lom-root textarea::placeholder { color: ${C.muted}; }
 .lom-root .lom-drag-over { box-shadow: inset 0 2px 0 ${C.accent}; }
+.lom-root .lom-drag-over-after { box-shadow: inset 0 -2px 0 ${C.accent}; }
 .lom-root .lom-dragging { opacity: 0.4; }
 .lom-root ::-webkit-scrollbar { width: 8px; }
 .lom-root ::-webkit-scrollbar-thumb { background: ${C.border}; border-radius: 4px; }
@@ -233,7 +260,7 @@ function MiniToggle(props: { value: boolean; onChange: (v: boolean) => void }) {
     const { C, S } = useTheme();
     return (
         <div
-            style={{ ...S.toggle, background: props.value ? C.accent : 'rgba(128,128,128,0.35)' }}
+            style={{ ...S.toggle, background: props.value ? C.accentDim : 'rgba(128,128,128,0.35)' }}
             onClick={() => props.onChange(!props.value)}
             title={props.value ? 'Enabled — click to disable (kept, not deleted)' : 'Disabled — click to enable'}
         >
@@ -245,52 +272,36 @@ function MiniToggle(props: { value: boolean; onChange: (v: boolean) => void }) {
 interface RowProps {
     item: ArgItem;
     dragging: boolean;
-    dragOver: boolean;
-    canDrop: boolean;
+    dropBefore: boolean;
+    dropAfter: boolean;
     autoFocusText: boolean;
     duplicate: boolean;
     onChange: (patch: Partial<ArgItem>, immediate?: boolean) => void;
     onDelete: () => void;
-    onDragStart: () => void;
-    onDragEnd: () => void;
-    onDragOverRow: () => void;
-    onDropOnRow: (dataId: string | null) => void;
+    onGripDown: (e: React.MouseEvent) => void;
+    registerEl: (el: HTMLElement | null) => void;
 }
 
 function ItemRow(props: RowProps) {
-    const { item, dragging, dragOver, canDrop, autoFocusText, duplicate } = props;
+    const { item, dragging, dropBefore, dropAfter, autoFocusText, duplicate } = props;
     const { C, S } = useTheme();
     const [noteOpen, setNoteOpen] = useState(false);
-    const rowRef = useRef<HTMLDivElement | null>(null);
     const showNote = noteOpen || Boolean(item.note);
 
     return (
         <div
-            ref={rowRef}
-            className={`${dragging ? 'lom-dragging' : ''} ${dragOver ? 'lom-drag-over' : ''}`}
+            ref={props.registerEl}
+            className={`${dragging ? 'lom-dragging' : ''} ${dropBefore ? 'lom-drag-over' : ''} ${dropAfter ? 'lom-drag-over-after' : ''}`}
             style={{ ...S.row, flexDirection: 'column', alignItems: 'stretch', gap: '4px', ...(item.enabled ? {} : S.rowDisabled) }}
-            onDragOver={(e) => {
-                if (!canDrop) return; // no preventDefault → browser shows not-allowed
-                e.preventDefault();
-                props.onDragOverRow();
-            }}
-            onDrop={(e) => { e.preventDefault(); props.onDropOnRow((e as any).dataTransfer?.getData('text/plain') || null); }}
         >
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                {/* The grip itself is the drag source: making the whole row
-                    draggable hijacks text selection in the inputs, and arming
-                    draggable on mousedown is too late for Blink (verified —
-                    the drag source is chosen at mousedown). */}
+                {/* Reordering uses plain mouse events: HTML5 drag-and-drop is
+                    unreliable in Steam's CEF on Linux (dragstart fires but the
+                    drag sequence dies — observed live). */}
                 <span
                     style={{ color: C.muted, cursor: 'grab', fontSize: '14px', lineHeight: 1, userSelect: 'none', padding: '2px 2px' }}
                     title="Drag to reorder"
-                    draggable
-                    onDragStart={(e) => {
-                        (e as any).dataTransfer?.setData('text/plain', item.id);
-                        if (rowRef.current) (e as any).dataTransfer?.setDragImage(rowRef.current, 20, 15);
-                        props.onDragStart();
-                    }}
-                    onDragEnd={props.onDragEnd}
+                    onMouseDown={props.onGripDown}
                 >⠿</span>
                 <MiniToggle value={item.enabled} onChange={(enabled) => props.onChange({ enabled }, true)} />
                 <input
@@ -298,8 +309,6 @@ function ItemRow(props: RowProps) {
                     value={item.text}
                     spellCheck={false}
                     autoFocus={autoFocusText}
-                    draggable={false}
-                    onDragStart={(e) => { e.preventDefault(); e.stopPropagation(); }}
                     onChange={(e) => props.onChange({ text: (e.target as HTMLInputElement).value })}
                 />
                 {duplicate && <span style={{ ...S.badge, color: C.yellow, borderColor: C.yellow, flexShrink: 0 }} title="Another enabled row sets the same option">duplicate</span>}
@@ -315,8 +324,6 @@ function ItemRow(props: RowProps) {
                         placeholder="Note to self (not sent to Steam)…"
                         value={item.note ?? ''}
                         autoFocus
-                        draggable={false}
-                        onDragStart={(e) => { e.preventDefault(); e.stopPropagation(); }}
                         onChange={(e) => props.onChange({ note: (e.target as HTMLInputElement).value })}
                         onBlur={() => setNoteOpen(false)}
                         onKeyDown={(e) => { if ((e as any).key === 'Enter') setNoteOpen(false); }}
@@ -349,7 +356,7 @@ function presetSignature(kind: ArgKind, text: string): string {
 
 // ── main window ─────────────────────────────────────────────────────────────
 
-type Tab = 'args' | 'presets' | 'profiles' | 'bulk';
+type Tab = 'args' | 'presets' | 'profiles' | 'bulk' | 'protondb';
 
 export function ManagerWindow({ appid }: { appid: number }) {
     // appid 0 = standalone mode (opened from the Steam menu): no game
@@ -379,6 +386,9 @@ export function ManagerWindow({ appid }: { appid: number }) {
     // empty rows) are persisted to the plugin store without a Steam write or
     // an 'Applying…' flash.
     const lastPushed = useRef<string | null>(null);
+    // Store generation at load time — if a backup restore replaced the store
+    // while this window is open, its state is stale and must not be persisted.
+    const storeGen = useRef(getStoreGeneration());
     const gameName = useMemo(() => (standalone ? 'Profiles & bulk apply' : getGameName(appid)), [appid]);
     const { C, S } = theme;
 
@@ -448,7 +458,7 @@ export function ManagerWindow({ appid }: { appid: number }) {
             if (applyTimer.current) clearTimeout(applyTimer.current);
             applyTimer.current = null;
             if (statusTimer.current) clearTimeout(statusTimer.current);
-            if (pendingItems.current) {
+            if (pendingItems.current && getStoreGeneration() === storeGen.current) {
                 const next = pendingItems.current;
                 pendingItems.current = null;
                 const composed = composeLaunchOptions(next);
@@ -467,6 +477,10 @@ export function ManagerWindow({ appid }: { appid: number }) {
         const run = async () => {
             applyTimer.current = null;
             pendingItems.current = null;
+            if (getStoreGeneration() !== storeGen.current) {
+                flash('The plugin store was restored — close and reopen this window to keep editing', 'yellow');
+                return;
+            }
             const seq = ++runSeq.current;
             const composed = composeLaunchOptions(next);
             setGameItems(appid, next, composed);
@@ -519,18 +533,15 @@ export function ManagerWindow({ appid }: { appid: number }) {
 
     const deleteItem = (id: string) => update(items.filter((it) => it.id !== id), true);
 
-    // Drag & drop within a section; cross-kind drops are ignored (order
-    // across kinds is fixed). Dragging downward lands BELOW the target so the
-    // last position is reachable; upward lands above it.
-    const reorderItem = (dragId: string, targetId: string) => {
+    // Drag & drop within a section; cross-kind moves are ignored (order
+    // across kinds is fixed). `after` = drop below the target row.
+    const reorderItem = (dragId: string, targetId: string, after: boolean) => {
         if (dragId === targetId) return;
         const dragged = items.find((it) => it.id === dragId);
         const target = items.find((it) => it.id === targetId);
         if (!dragged || !target || dragged.kind !== target.kind) return;
-        const from = items.indexOf(dragged);
-        const to = items.indexOf(target);
         const next = items.filter((it) => it.id !== dragId);
-        next.splice(next.indexOf(target) + (from < to ? 1 : 0), 0, dragged);
+        next.splice(next.indexOf(target) + (after ? 1 : 0), 0, dragged);
         if (next.every((it, i) => it === items[i])) return;
         update(next, true);
     };
@@ -551,10 +562,11 @@ export function ManagerWindow({ appid }: { appid: number }) {
             { id: 'bulk', label: 'Bulk apply' },
         ]
         : [
-            { id: 'args', label: 'Arguments' },
-            { id: 'presets', label: 'Presets' },
-            { id: 'profiles', label: 'Profiles' },
-            { id: 'bulk', label: 'Bulk apply' },
+            { id: 'args' as Tab, label: 'Arguments' },
+            { id: 'presets' as Tab, label: 'Presets' },
+            ...(isShortcut(appid) ? [] : [{ id: 'protondb' as Tab, label: 'ProtonDB' }]),
+            { id: 'profiles' as Tab, label: 'Profiles' },
+            { id: 'bulk' as Tab, label: 'Bulk apply' },
         ];
 
     return (
@@ -604,6 +616,19 @@ export function ManagerWindow({ appid }: { appid: number }) {
                                 setTab('args');
                             }} />
                     )}
+                    {tab === 'protondb' && (
+                        <ProtonDBTab appid={appid} flash={flash}
+                            onUse={(lo) => {
+                                const parsed = parseLaunchOptions(lo);
+                                // keep existing disabled rows — unless the new
+                                // string is raw-mode, where they'd be hidden
+                                const keepDisabled = parsed.some((it) => it.kind === 'raw')
+                                    ? []
+                                    : items.filter((it) => !it.enabled && it.kind !== 'raw');
+                                update([...parsed, ...keepDisabled], true);
+                                setTab('args');
+                            }} />
+                    )}
                     {tab === 'bulk' && <BulkTab flash={flash} currentAppid={appid} onAppliedToCurrent={adoptItems} />}
                 </div>
                 {!standalone && <div style={S.preview} className="lom-preview">
@@ -634,16 +659,79 @@ function ArgsTab(props: {
     items: ArgItem[]; hasRaw: boolean; focusId: string | null;
     onChange: (id: string, patch: Partial<ArgItem>, immediate?: boolean) => void;
     onDelete: (id: string) => void;
-    onReorder: (dragId: string, targetId: string) => void;
+    onReorder: (dragId: string, targetId: string, after: boolean) => void;
     onAdd: (kind: ArgKind, text?: string) => void;
     onClearAll: () => void;
 }) {
     const { items, hasRaw, focusId, onChange, onDelete, onReorder, onAdd, onClearAll } = props;
     const { C, S } = useTheme();
     const [dragId, setDragId] = useState<string | null>(null);
-    const [overId, setOverId] = useState<string | null>(null);
+    const [dropTarget, setDropTarget] = useState<{ id: string; after: boolean } | null>(null);
     const [confirmClear, setConfirmClear] = useState(false);
-    const dragKind = dragId ? items.find((it) => it.id === dragId)?.kind ?? null : null;
+    const rowEls = useRef(new Map<string, HTMLElement>());
+    const dropRef = useRef<{ id: string; after: boolean } | null>(null);
+
+    // Plain-mouse drag: grip mousedown arms it; past a 5px threshold the row
+    // follows the cursor among its same-kind siblings; mouseup commits.
+    const startDrag = (item: ArgItem) => (e: React.MouseEvent) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        const doc = (e.currentTarget as HTMLElement).ownerDocument;
+        const startX = (e as any).clientX;
+        const startY = (e as any).clientY;
+        let active = false;
+        const siblings = items.filter((x) => x.kind === item.kind);
+
+        const cancel = () => {
+            doc.removeEventListener('mousemove', onMove, true);
+            doc.removeEventListener('mouseup', onUp, true);
+            dropRef.current = null;
+            setDragId(null);
+            setDropTarget(null);
+        };
+        const onMove = (ev: MouseEvent) => {
+            // the mouseup was lost (focus stolen mid-drag): abort, otherwise
+            // the next innocent click would commit a phantom reorder
+            if ((ev.buttons & 1) === 0) {
+                cancel();
+                return;
+            }
+            if (!active) {
+                if (Math.abs(ev.clientX - startX) + Math.abs(ev.clientY - startY) < 5) return;
+                active = true;
+                setDragId(item.id);
+            }
+            let best: { id: string; after: boolean } | null = null;
+            let firstRect: DOMRect | null = null;
+            let lastSib: { id: string; rect: DOMRect } | null = null;
+            for (const sib of siblings) {
+                const el = rowEls.current.get(sib.id);
+                if (!el) continue;
+                const rect = el.getBoundingClientRect();
+                if (!firstRect) firstRect = rect;
+                lastSib = { id: sib.id, rect };
+                if (ev.clientY >= rect.top && ev.clientY <= rect.bottom) {
+                    best = { id: sib.id, after: ev.clientY > rect.top + rect.height / 2 };
+                }
+            }
+            // above the first row / below the last row of the section
+            if (!best && firstRect && ev.clientY < firstRect.top) best = { id: siblings[0].id, after: false };
+            if (!best && lastSib && ev.clientY > lastSib.rect.bottom) best = { id: lastSib.id, after: true };
+            if (best) {
+                dropRef.current = best;
+                setDropTarget(best);
+            }
+        };
+        const onUp = (ev: MouseEvent) => {
+            if (ev.button !== 0) return; // only the left button ends the drag
+            const drop = dropRef.current;
+            const commit = active && drop && drop.id !== item.id;
+            cancel();
+            if (commit) onReorder(item.id, drop!.id, drop!.after);
+        };
+        doc.addEventListener('mousemove', onMove, true);
+        doc.addEventListener('mouseup', onUp, true);
+    };
 
     // Same option set twice among ENABLED rows (env vars by name,
     // wrappers/flags by first token) — flagged with a badge.
@@ -702,22 +790,16 @@ function ArgsTab(props: {
                         {sectionItems.map((it) => (
                             <ItemRow key={it.id} item={it}
                                 dragging={dragId === it.id}
-                                dragOver={overId === it.id && dragId !== null && dragId !== it.id}
-                                canDrop={dragId === null || dragKind === sec.kind}
+                                dropBefore={dropTarget?.id === it.id && !dropTarget.after && dragId !== null && dragId !== it.id}
+                                dropAfter={dropTarget?.id === it.id && Boolean(dropTarget?.after) && dragId !== null && dragId !== it.id}
                                 autoFocusText={focusId === it.id}
                                 duplicate={isDuplicate(it)}
                                 onChange={(patch, immediate) => onChange(it.id, patch, immediate)}
                                 onDelete={() => onDelete(it.id)}
-                                onDragStart={() => setDragId(it.id)}
-                                onDragEnd={() => { setDragId(null); setOverId(null); }}
-                                onDragOverRow={() => setOverId(it.id)}
-                                onDropOnRow={(dataId) => {
-                                    // dataTransfer payload must corroborate our
-                                    // state — guards against stale dragIds from
-                                    // cancelled selection-drags
-                                    if (dragId && dataId === dragId) onReorder(dragId, it.id);
-                                    setDragId(null);
-                                    setOverId(null);
+                                onGripDown={startDrag(it)}
+                                registerEl={(el) => {
+                                    if (el) rowEls.current.set(it.id, el);
+                                    else rowEls.current.delete(it.id);
                                 }} />
                         ))}
                         <button style={S.addBtn} onClick={() => onAdd(sec.kind)}>+ add</button>
@@ -745,11 +827,12 @@ function ArgsTab(props: {
 // Why a preset may not work here; null = no objection. The user's GPU choice
 // in plugin settings overrides the driver probe.
 function presetIssue(p: Preset, caps: Capabilities | null, proton: boolean | null, vendor: GpuVendor): string | null {
+    if (p.bin && caps && caps.bins[p.bin] === false) return `${p.bin} is not installed`;
+    if (p.proton && proton === false) return 'Proton games only — this game runs natively';
+    if (vendor === 'off') return null; // user disabled vendor-based hints
     const nvidia = vendor === 'nvidia' ? true : vendor === 'amd' ? false : caps ? caps.nvidia : null;
     const amd = vendor === 'amd' ? true : vendor === 'nvidia' ? false : caps ? caps.amd : null;
     const intel = vendor === 'auto' ? (caps ? caps.intel : null) : false;
-    if (p.bin && caps && caps.bins[p.bin] === false) return `${p.bin} is not installed`;
-    if (p.proton && proton === false) return 'Proton games only — this game runs natively';
     if (p.gpu === 'nvidia' && nvidia === false) return 'NVIDIA-only option';
     if (p.gpu === 'amd' && amd === false && nvidia) return 'AMD-only option';
     // Mesa drives AMD and Intel GPUs; only flag when neither is present
@@ -906,7 +989,27 @@ function ProfilesTab(props: {
                 </div>
             </div>}
             <div style={S.section}>
-                <div style={S.sectionTitle}>Profiles</div>
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: '8px' }}>
+                    <div style={S.sectionTitle}>Profiles</div>
+                    <div style={{ marginLeft: 'auto', display: 'flex', gap: '6px' }}>
+                        <button style={S.smallBtn} title="Write all profiles to lom-profiles.json in the plugin directory"
+                            onClick={async () => {
+                                const res = await exportProfiles();
+                                if (res.ok) flash(`Exported to ${res.path}`, 'green');
+                                else flash('Export failed — see console', 'red');
+                            }}>Export file</button>
+                        <button style={S.smallBtn} title="Import profiles from lom-profiles.json in the plugin directory"
+                            onClick={async () => {
+                                const res = await importProfiles();
+                                if (!res.ok) flash(`Import failed: ${res.error}`, 'red');
+                                else {
+                                    flash(`Imported ${res.added + res.renamed} profile${res.added + res.renamed === 1 ? '' : 's'}`
+                                        + `${res.renamed ? ` (${res.renamed} renamed)` : ''}${res.skipped ? `, ${res.skipped} already present` : ''}`, 'green');
+                                    bump((n) => n + 1);
+                                }
+                            }}>Import file</button>
+                    </div>
+                </div>
                 {!profiles.length && <div style={{ color: C.muted }}>
                     {standalone
                         ? "No profiles yet. Open a game's launch options manager and save one from its Profiles tab."
@@ -934,6 +1037,84 @@ function ProfilesTab(props: {
                     </div>
                 ))}
             </div>
+        </div>
+    );
+}
+
+function ProtonDBTab(props: {
+    appid: number;
+    flash: (msg: string, color?: keyof Palette, autoClear?: boolean) => void;
+    onUse: (lo: string) => void;
+}) {
+    const { appid, flash, onUse } = props;
+    const { C, S } = useTheme();
+    const [result, setResult] = useState<PDBResult | null>(null);
+    const [expanded, setExpanded] = useState<string | null>(null);
+
+    useEffect(() => {
+        fetchProtonDBReports(appid).then(setResult);
+    }, [appid]);
+
+    if (!result) {
+        return <div style={{ color: C.muted }}>Fetching community reports from ProtonDB…</div>;
+    }
+    if (result.error) {
+        return (
+            <div style={{ color: C.muted, lineHeight: 1.6 }}>
+                Could not load ProtonDB reports: {result.error}.
+                <br />The reports are also browsable at protondb.com.
+            </div>
+        );
+    }
+    if (!result.groups.length) {
+        return (
+            <div style={{ color: C.muted }}>
+                None of the {result.totalReports} ProtonDB report{result.totalReports === 1 ? '' : 's'} for this
+                game include launch options.
+            </div>
+        );
+    }
+
+    const fmtDate = (ts: number) => {
+        const d = new Date(ts * 1000);
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    };
+
+    return (
+        <div>
+            <div style={{ ...S.section, color: C.muted, lineHeight: 1.6 }}>
+                Launch options used by ProtonDB reporters for this game ({result.totalReports} reports total,
+                {' '}{result.groups.reduce((n, g) => n + g.count, 0)} with launch options), most used first.
+                <b> Use</b> replaces your current arguments — your previous set stays in the plugin store until
+                you edit further, and disabled rows are kept either way.
+            </div>
+            {result.groups.slice(0, 40).map((g) => {
+                const isOpen = expanded === g.lo;
+                return (
+                    <div key={g.lo} className="lom-preset-row"
+                        style={{ ...S.presetRow, marginLeft: 0, flexDirection: 'column', alignItems: 'stretch', gap: '4px' }}
+                        onClick={() => setExpanded(isOpen ? null : g.lo)}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <div style={{ flex: 1, minWidth: 0, fontFamily: C.mono, fontSize: '12px', ...(isOpen ? {} : { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }) }}>
+                                {g.lo}
+                            </div>
+                            <span style={{ ...S.badge, flexShrink: 0 }} title="Reports using exactly this string">{g.count}×</span>
+                            <span style={{ ...S.badge, flexShrink: 0 }} title="Most recent report">{fmtDate(g.latest)}</span>
+                            <button style={{ ...S.smallBtn, flexShrink: 0 }}
+                                onClick={(e) => {
+                                    e.stopPropagation();
+                                    onUse(g.lo);
+                                    flash('Community launch options applied', 'green', true);
+                                }}>Use</button>
+                        </div>
+                        {isOpen && (
+                            <div style={{ color: C.muted, fontSize: '11px' }} onClick={(e) => e.stopPropagation()}>
+                                {g.protons.length > 0 && <>Proton versions: {g.protons.join(', ')}</>}
+                            </div>
+                        )}
+                    </div>
+                );
+            })}
         </div>
     );
 }
