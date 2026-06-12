@@ -1,2 +1,7 @@
 node_modules/
 frontend/model.js
+lom-store.json
+lom-store.json.bak
+lom-profiles.json
+*.swap
+*.tmp
