@@ -16,6 +16,7 @@ import {
     getUserCollections,
     deleteProfile,
     fetchProtonDBReports,
+    fetchProtonDBSummary,
     importProfilesFromText,
     PDBResult,
     serializeProfiles,
@@ -63,20 +64,20 @@ const FALLBACK: Palette & PaletteExtra = {
     border: 'rgba(255,255,255,0.09)',
     text: '#dcdedf',
     muted: '#8b929a',
-    accent: '#666cff',
+    accent: '#1a9fff',
     green: '#5ba32b',
     red: '#d94126',
     yellow: '#e8a33d',
     mono: '"DejaVu Sans Mono", Consolas, monospace',
     input: '#161b21',
     header: '#2f3845',
-    accentHover: '#878cff',
-    accentDim: 'rgb(72, 76, 179)',
+    accentHover: '#3eb1ff',
+    accentDim: 'rgb(18, 111, 178)',
 };
 
 // the accent every UI element should follow when the theme doesn't provide
 // one — exported so the settings panel can show/use the effective value
-export const DEFAULT_ACCENT = '#666cff';
+export const DEFAULT_ACCENT = '#1a9fff';
 
 // parse '#rrggbb' or 'rgb(r, g, b)' into channels
 function parseColor(color: string): [number, number, number] | null {
@@ -157,7 +158,7 @@ function makeStyles(C: Palette): Record<string, React.CSSProperties> {
             background: C.bg, color: C.text, fontSize: '13px',
         },
         tabBar: { display: 'flex', gap: '6px', padding: '10px 14px', flexShrink: 0 },
-        tab: { padding: '6px 16px', cursor: 'pointer', borderRadius: '14px', color: C.muted, userSelect: 'none', border: '1px solid transparent' },
+        tab: { padding: '6px 16px', cursor: 'pointer', borderRadius: '8px', color: C.muted, userSelect: 'none', border: '1px solid transparent', whiteSpace: 'nowrap', flexShrink: 0 },
         tabActive: { background: C.accentDim, color: '#fff' },
         body: { flex: 1, overflowY: 'auto', padding: '12px 16px' },
         section: { marginBottom: '16px' },
@@ -209,7 +210,11 @@ function makeStyles(C: Palette): Record<string, React.CSSProperties> {
         },
         pill: {
             background: C.panel, color: C.text, border: `1px solid ${C.border}`, cursor: 'pointer',
-            padding: '4px 12px', borderRadius: '14px', fontSize: '12px',
+            padding: '4px 12px', borderRadius: '8px', fontSize: '12px',
+        },
+        actionBtn: {
+            background: C.accentDim, color: '#fff', border: '1px solid transparent', cursor: 'pointer',
+            padding: '4px 14px', borderRadius: '8px', fontSize: '12px', fontWeight: 600,
         },
         pillActive: {
             background: C.accentDim, color: '#fff', border: `1px solid ${C.accentDim}`,
@@ -391,6 +396,15 @@ function ItemRow(props: RowProps) {
     );
 }
 
+const PDB_TIER_COLORS: Record<string, string> = {
+    platinum: '#b4c7dc',
+    gold: '#cfb53b',
+    silver: '#c0c0c0',
+    bronze: '#cd7f32',
+    borked: '#ff5e5e',
+    pending: '#8b929a',
+};
+
 const KIND_SECTIONS: { kind: ArgKind; title: string; hint: string; placeholder: string }[] = [
     { kind: 'env', title: 'Environment variables', hint: 'VAR=value, set before the game starts', placeholder: 'PROTON_LOG=1' },
     { kind: 'wrapper', title: 'Wrappers (run before %command%)', hint: 'commands that wrap the game process', placeholder: 'gamemoderun' },
@@ -412,7 +426,7 @@ function presetSignature(kind: ArgKind, text: string): string {
 
 // ── main window ─────────────────────────────────────────────────────────────
 
-type Tab = 'args' | 'presets' | 'profiles' | 'bulk' | 'protondb';
+type Tab = 'args' | 'presets' | 'profiles' | 'bulk' | 'protondb' | 'info';
 
 export function ManagerWindow({ appid }: { appid: number }) {
     // appid 0 = standalone mode (opened from the Steam menu): no game
@@ -427,6 +441,7 @@ export function ManagerWindow({ appid }: { appid: number }) {
     const [statusColor, setStatusColor] = useState<keyof Palette>('muted');
     const [caps, setCaps] = useState<Capabilities | null>(null);
     const [proton, setProton] = useState<boolean | null>(null);
+    const [pdbTier, setPdbTier] = useState<string | null>(null);
     const [theme, setTheme] = useState<{ C: Palette; S: Record<string, React.CSSProperties> }>(
         () => ({ C: FALLBACK, S: makeStyles(FALLBACK) }));
     const rootRef = useRef<HTMLDivElement | null>(null);
@@ -503,6 +518,9 @@ export function ManagerWindow({ appid }: { appid: number }) {
         getGameItems(appid).then(({ items: loadedItems, liveUnknown, proton: protonFlag }) => {
             setItems(loadedItems);
             setProton(protonFlag);
+            if (protonFlag && !isShortcut(appid)) {
+                fetchProtonDBSummary(appid).then((sum) => setPdbTier(sum?.tier ?? null));
+            }
             lastPushed.current = composeLaunchOptions(loadedItems);
             if (persistenceBlocked()) {
                 flash('Changes are NOT saved — the plugin store file could not be read', 'red');
@@ -653,8 +671,9 @@ export function ManagerWindow({ appid }: { appid: number }) {
 
     const tabs: { id: Tab; label: string }[] = standalone
         ? [
-            { id: 'profiles', label: 'Profiles' },
-            { id: 'bulk', label: 'Bulk apply' },
+            { id: 'profiles' as Tab, label: 'Profiles' },
+            { id: 'bulk' as Tab, label: 'Bulk apply' },
+            { id: 'info' as Tab, label: 'Info' },
         ]
         : [
             { id: 'args' as Tab, label: 'Arguments' },
@@ -662,6 +681,7 @@ export function ManagerWindow({ appid }: { appid: number }) {
             ...(isShortcut(appid) ? [] : [{ id: 'protondb' as Tab, label: 'ProtonDB' }]),
             { id: 'profiles' as Tab, label: 'Profiles' },
             { id: 'bulk' as Tab, label: 'Bulk apply' },
+            { id: 'info' as Tab, label: 'Info' },
         ];
 
     return (
@@ -681,18 +701,14 @@ export function ManagerWindow({ appid }: { appid: number }) {
                             {proton ? 'Proton' : 'native Linux'}
                         </div>
                     )}
-                    <span style={{ color: C[statusColor] as string, fontSize: '12px', marginLeft: 'auto' }}>{status}</span>
-                    {!standalone && (
-                        <span style={{ display: 'flex', gap: '2px' }}>
-                            <button
-                                style={{ ...S.iconBtn, fontSize: '15px', ...(undoStack.current.length ? {} : { opacity: 0.3, cursor: 'default' }) }}
-                                title="Undo (revert the last change, including applied ProtonDB/profile sets)"
-                                onClick={undo}>↶</button>
-                            <button
-                                style={{ ...S.iconBtn, fontSize: '15px', ...(redoStack.current.length ? {} : { opacity: 0.3, cursor: 'default' }) }}
-                                title="Redo"
-                                onClick={redo}>↷</button>
-                        </span>
+                    {pdbTier && (
+                        <div style={{
+                            ...S.badge,
+                            background: PDB_TIER_COLORS[pdbTier] ?? S.badge.background,
+                            color: '#1a1a1a', fontWeight: 600, border: 'none',
+                        }} title="Community compatibility rating from protondb.com">
+                            ProtonDB: {pdbTier}
+                        </div>
                     )}
                 </div>
                 <div style={S.tabBar}>
@@ -702,6 +718,22 @@ export function ManagerWindow({ appid }: { appid: number }) {
                             {t.label}
                         </div>
                     ))}
+                    <span title={status} style={{
+                        color: C[statusColor] as string, fontSize: '12px', marginLeft: 'auto', alignSelf: 'center',
+                        minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                    }}>{status}</span>
+                    {!standalone && (
+                        <span style={{ display: 'flex', gap: '4px', marginLeft: '10px', flexShrink: 0 }}>
+                            <button
+                                style={{ ...S.smallBtn, fontSize: '16px', padding: '3px 12px', lineHeight: 1.2, ...(undoStack.current.length ? {} : { opacity: 0.35, cursor: 'default' }) }}
+                                title="Undo (reverts the last change, including applied ProtonDB/profile sets)"
+                                onClick={undo}>↶</button>
+                            <button
+                                style={{ ...S.smallBtn, fontSize: '16px', padding: '3px 12px', lineHeight: 1.2, ...(redoStack.current.length ? {} : { opacity: 0.35, cursor: 'default' }) }}
+                                title="Redo"
+                                onClick={redo}>↷</button>
+                        </span>
+                    )}
                 </div>
                 <div style={S.body} className="lom-fade" key={tab}>
                     {tab === 'args' && (
@@ -737,6 +769,7 @@ export function ManagerWindow({ appid }: { appid: number }) {
                             }} />
                     )}
                     {tab === 'bulk' && <BulkTab flash={flash} currentAppid={appid} onAppliedToCurrent={adoptItems} />}
+                    {tab === 'info' && <InfoTab />}
                 </div>
                 {!standalone && <div style={S.preview} className="lom-preview">
                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
@@ -1024,7 +1057,7 @@ function PresetsTab(props: {
                                         </div>
                                         {exact
                                             ? <span style={{ ...S.badge, color: C.green, borderColor: C.green, flexShrink: 0 }}>✓ added</span>
-                                            : <button style={{ ...S.smallBtn, flexShrink: 0 }}
+                                            : <button style={{ ...S.actionBtn, flexShrink: 0 }}
                                                 onClick={(e) => { e.stopPropagation(); onAdd(p); }}>{similar ? '+ Add variant' : '+ Add'}</button>}
                                     </div>
                                     {expanded && (
@@ -1064,15 +1097,8 @@ function ProfilesTab(props: {
 
     return (
         <div>
-            <div style={{ ...S.section, color: C.muted, lineHeight: 1.6 }}>
-                {standalone
-                    ? <>A profile is a named, reusable set of launch arguments, saved from a game's launch
-                        options manager. Use <b>Bulk apply</b> to write one to many games at once.
-                        Profiles are copies — editing a game later doesn't change the profile.</>
-                    : <>A profile is a named, reusable set of arguments. Build the set you like on the
-                        <b> Arguments</b> tab, save it here, then <b>Load</b> it onto any other game (replacing its
-                        arguments) or <b>+ Merge</b> it on top of them. <b>Bulk apply</b> writes a profile to many
-                        games at once. Profiles are copies — editing a game later doesn't change the profile.</>}
+            <div style={{ ...S.section, color: C.muted, fontSize: '12px' }}>
+                Named, reusable argument sets — see the <b>Info</b> tab for how they work.
             </div>
             {!standalone && <div style={S.section}>
                 <div style={S.sectionTitle}>Save current arguments as a profile</div>
@@ -1145,11 +1171,67 @@ function ProfilesTab(props: {
                                 ? 'Unavailable in raw mode — merged items would be ignored by the raw string'
                                 : "Add the profile's arguments on top of the current ones"}
                             onClick={() => { if (!hasRaw) onLoad(p.items, false); }}>+ Merge</button>}
-                        <button style={{ ...S.iconBtn, color: C.red }} title="Delete profile"
-                            onClick={() => { deleteProfile(p.name); bump((n) => n + 1); }}>✕</button>
+                        {p.name !== 'Default' && (
+                            <button style={{ ...S.iconBtn, color: C.red }} title="Delete profile"
+                                onClick={() => { deleteProfile(p.name); bump((n) => n + 1); }}>✕</button>
+                        )}
                     </div>
                 ))}
             </div>
+        </div>
+    );
+}
+
+function InfoTab() {
+    const { C, S } = useTheme();
+    const H = ({ children }: { children: any }) => (
+        <div style={{ ...S.sectionTitle, marginTop: '14px', color: C.accent }}>{children}</div>
+    );
+    const P = ({ children }: { children: any }) => (
+        <div style={{ lineHeight: 1.6, fontSize: '13px', marginBottom: '6px' }}>{children}</div>
+    );
+    return (
+        <div style={{ maxWidth: '720px' }}>
+            <P><b>Launch Options Manager</b> replaces Steam's single launch-options text field with a
+                structured, per-game editor. Everything applies to Steam instantly — no restarts.</P>
+
+            <H>Arguments</H>
+            <P>Launch options are split into three sections: <b>environment variables</b> (VAR=value, set
+                before the game starts), <b>wrappers</b> (commands like gamemoderun that wrap the game
+                process), and <b>game arguments</b> (flags passed to the game itself). The final string —
+                shown at the bottom — is composed as <span style={{ fontFamily: C.mono }}>ENV… wrappers… %command% flags…</span>,
+                with %command% added automatically when needed.</P>
+            <P>Each row has a toggle: disabling keeps the argument in the plugin's storage but removes it
+                from Steam — nothing is lost by switching things off. Reorder rows by dragging the ⠿ grip,
+                annotate them with ✎ notes (never sent to Steam), and use ↶/↷ to undo and redo any change.
+                Conflicting combinations (like MangoHud under gamescope) are flagged automatically.</P>
+
+            <H>Presets</H>
+            <P>A curated catalog of known Linux/Proton options. Click a preset to read what it does;
+                presets that can't work on this system or game are dimmed with a reason (missing program,
+                Proton-only option on a native game, wrong GPU vendor — configurable in plugin settings).</P>
+
+            <H>ProtonDB</H>
+            <P>Community-reported launch options for this game, fetched live from protondb.com, grouped by
+                how many reporters used the same string. Unfold an entry for reporter comments; <b>Use</b> applies
+                it (↶ reverts). The colored badge in the title bar shows the game's community rating.</P>
+
+            <H>Profiles &amp; bulk apply</H>
+            <P>A profile is a named copy of an argument set. Save the current arguments as a profile, then
+                <b> Load</b> it onto another game (replacing its arguments) or <b>+ Merge</b> it on top.
+                <b> Bulk apply</b> writes a profile to many games at once — pick games by collection with the
+                pills. The <b>Default</b> profile is created on first run and can't be deleted, so there is
+                always a baseline to fall back to. Export/Import shares profiles as JSON files.</P>
+
+            <H>Data &amp; safety</H>
+            <P>Everything lives in <span style={{ fontFamily: C.mono }}>lom-store.json</span> in the plugin
+                folder (a .bak of the previous generation is kept automatically). Full backups and restores
+                are available in the plugin's Millennium settings. Steam itself only ever sees the composed
+                launch-options string — uninstalling the plugin leaves your games exactly as configured.</P>
+
+            <H>Entry points</H>
+            <P>The 🔧 button on a game's page, the 🔧 inside the launch-options field in game Properties,
+                and "Launch Options" in the top-left Steam menu (profiles &amp; bulk apply without a game).</P>
         </div>
     );
 }
@@ -1200,11 +1282,6 @@ function ProtonDBTab(props: {
 
     return (
         <div>
-            <div style={{ ...S.section, color: C.muted, lineHeight: 1.6 }}>
-                Launch options used by ProtonDB reporters for this game ({result.totalReports} reports total,
-                {' '}{result.groups.reduce((n, g) => n + g.count, 0)} with launch options).
-                <b> Use</b> replaces your current arguments (undo ↶ reverts); disabled rows are kept.
-            </div>
             <div style={{ display: 'flex', gap: '6px', marginBottom: '10px' }}>
                 <button style={{ ...S.pill, ...(sort === 'popular' ? S.pillActive : {}) }}
                     onClick={() => setSort('popular')}>Most used</button>
@@ -1223,7 +1300,8 @@ function ProtonDBTab(props: {
                             </div>
                             <span style={{ ...S.badge, flexShrink: 0 }} title="Reports using exactly this string">{g.count}×</span>
                             <span style={{ ...S.badge, flexShrink: 0 }} title="Most recent report">{fmtDate(g.latest)}</span>
-                            <button style={{ ...S.smallBtn, flexShrink: 0 }}
+                            <button style={{ ...S.actionBtn, flexShrink: 0 }}
+                                title="Replace your current arguments with this set (undo ↶ reverts)"
                                 onClick={(e) => {
                                     e.stopPropagation();
                                     onUse(g.lo);
@@ -1231,8 +1309,18 @@ function ProtonDBTab(props: {
                                 }}>Use</button>
                         </div>
                         {isOpen && (
-                            <div style={{ color: C.muted, fontSize: '11px' }} onClick={(e) => e.stopPropagation()}>
-                                {g.protons.length > 0 && <>Proton versions: {g.protons.join(', ')}</>}
+                            <div style={{ fontSize: '12px', lineHeight: 1.5 }} onClick={(e) => e.stopPropagation()}>
+                                {g.notes.map((n, i) => (
+                                    <div key={i} style={{ color: C.text, opacity: 0.85, borderLeft: `2px solid ${C.border}`, padding: '2px 8px', margin: '4px 0' }}>
+                                        “{n}”
+                                    </div>
+                                ))}
+                                {g.protons.length > 0 && (
+                                    <div style={{ color: C.muted, fontSize: '11px', marginTop: '4px' }}>Proton: {g.protons.join(', ')}</div>
+                                )}
+                                {!g.notes.length && !g.protons.length && (
+                                    <div style={{ color: C.muted, fontSize: '11px' }}>No reporter comments.</div>
+                                )}
                             </div>
                         )}
                     </div>

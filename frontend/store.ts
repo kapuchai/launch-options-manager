@@ -369,6 +369,8 @@ export function saveProfile(name: string, items: ArgItem[]): void {
 }
 
 export function deleteProfile(name: string): void {
+    // the starter Default profile is the documented fallback — keep it
+    if (name === 'Default') return;
     store.profiles = store.profiles.filter((p) => p.name !== name);
     flushStore();
 }
@@ -382,12 +384,38 @@ export interface PDBGroup {
     count: number;       // how many reports used it
     latest: number;      // newest report timestamp (s)
     protons: string[];   // proton versions seen with it (most recent first)
+    notes: string[];     // reporter comments (newest first, deduped)
 }
 
 export interface PDBResult {
     groups: PDBGroup[];
     totalReports: number;
     error?: string;
+}
+
+const backendGetPDBSummary = callable<[{ a_appid: number }], string>('GetProtonDBSummary');
+
+export interface PDBSummary {
+    tier: string;
+    total: number;
+}
+
+const pdbSummaryCache = new Map<number, PDBSummary | null>();
+
+export async function fetchProtonDBSummary(appid: number): Promise<PDBSummary | null> {
+    if (pdbSummaryCache.has(appid)) return pdbSummaryCache.get(appid)!;
+    let result: PDBSummary | null = null;
+    try {
+        const parsed = JSON.parse(String(await backendGetPDBSummary({ a_appid: appid })));
+        if (!parsed.__error && typeof parsed.tier === 'string') {
+            result = { tier: parsed.tier, total: Number(parsed.total ?? 0) };
+        }
+    } catch (e) {
+        console.error('[launch-options-manager] ProtonDB summary fetch failed', e);
+    }
+    // transient failures stay retryable; only real results are memoized
+    if (result) pdbSummaryCache.set(appid, result);
+    return result;
 }
 
 const pdbCache = new Map<number, PDBResult>();
@@ -402,21 +430,26 @@ export async function fetchProtonDBReports(appid: number): Promise<PDBResult> {
             result = { groups: [], totalReports: 0, error: String(parsed.__error) };
         } else {
             const reports: any[] = Array.isArray(parsed.reports) ? parsed.reports : [];
-            const byText = new Map<string, PDBGroup & { protonSet: Set<string> }>();
+            const byText = new Map<string, PDBGroup & { protonSet: Set<string>; noteList: { ts: number; note: string }[] }>();
             for (const r of reports) {
                 const lo = String(r.lo ?? '').trim();
                 if (!lo) continue;
                 let g = byText.get(lo);
                 if (!g) {
-                    g = { lo, count: 0, latest: 0, protons: [], protonSet: new Set() };
+                    g = { lo, count: 0, latest: 0, protons: [], notes: [], protonSet: new Set(), noteList: [] };
                     byText.set(lo, g);
                 }
                 g.count++;
                 if (r.ts > g.latest) g.latest = r.ts;
                 if (r.proton) g.protonSet.add(String(r.proton));
+                const note = String(r.note ?? '').trim();
+                if (note) g.noteList.push({ ts: r.ts ?? 0, note });
             }
             const groups = [...byText.values()]
-                .map((g) => ({ lo: g.lo, count: g.count, latest: g.latest, protons: [...g.protonSet].slice(0, 3) }))
+                .map((g) => {
+                    const notes = [...new Set(g.noteList.sort((a, b) => b.ts - a.ts).map((n) => n.note))].slice(0, 3);
+                    return { lo: g.lo, count: g.count, latest: g.latest, protons: [...g.protonSet].slice(0, 3), notes };
+                })
                 .sort((a, b) => b.count - a.count || b.latest - a.latest);
             result = { groups, totalReports: Number(parsed.total ?? reports.length) };
         }

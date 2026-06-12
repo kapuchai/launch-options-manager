@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from 'react';
-import { Field, IconsModule, Millennium, Toggle, definePlugin, findModule, showModal, sleep } from '@steambrew/client';
+import { Field, IconsModule, Millennium, definePlugin, findModule, showModal, sleep } from '@steambrew/client';
 import { DEFAULT_ACCENT, ManagerWindow, downloadText, pickTextFile } from './manager';
 import { composeLaunchOptions } from './model';
-import { flushStore, getGameName, getStore, getUISettings, loadStore, persistenceBlocked, replaceStoreFromText, restoreBackup, serializeStore, updateUISettings } from './store';
+import { flushStore, getGameName, getStore, getUISettings, loadStore, persistenceBlocked, replaceStoreFromText, serializeStore, updateUISettings } from './store';
 import { getMainWindowPopup, setMainWindowPopup } from './windows';
 
 declare const uiStore: any;
@@ -39,12 +39,7 @@ function openManager(triggerPopup: any, appid: number) {
 function maybeInjectAppButton(popup: any): void {
     const doc = popup?.m_popup?.document;
     if (!doc) return;
-    const existing = doc.querySelector('div.lom-button');
-    if (!getUISettings().showAppButton) {
-        existing?.remove();
-        return;
-    }
-    if (existing) return;
+    if (doc.querySelector('div.lom-button')) return;
 
     let selector: string;
     try {
@@ -145,7 +140,6 @@ async function watchPropertiesDialog(popup: any) {
     const appid = parseInt(match[1], 10);
 
     const tryInject = () => {
-        if (!getUISettings().showPropsButton) return;
         // general = regular games; shortcut = non-Steam games' equivalent page
         if (/\/properties\/(general|shortcut)_Content$/.test(panel.id)) {
             injectPropertiesButton(popup, panel, appid).catch((e) =>
@@ -209,23 +203,13 @@ let rootMenuPopup: any = null;
 // restart entry. Idempotent: also removes the item when the setting is off.
 async function applySteamMenuItem(popup: any) {
     if (!popup?.m_popup?.document) return;
-    // the settings must come from the real store, not pre-load defaults — the
-    // menu popup is created during the same startup burst as plugin init
-    await loadStore();
     const doc = popup.m_popup.document;
-    const existing = doc.querySelector('.lom-menu-item');
-    if (!getUISettings().showSteamMenuItem) {
-        existing?.remove();
-        return;
-    }
-    if (existing) return;
+    if (doc.querySelector('.lom-menu-item')) return;
     // NO timeout here: the popup is created hidden at boot and its menu items
     // only render when the menu is first opened — a timed wait expires hours
     // before that. (This exact mistake shipped once; librarian waits forever.)
     const menuItems = [...(await Millennium.findElement(doc, "div#popup_target div[role='menuitem']"))] as HTMLElement[];
-    // the boot-time waiter can resolve hours later — the setting may have
-    // been turned off in the meantime
-    if (!getUISettings().showSteamMenuItem || !menuItems.length || doc.querySelector('.lom-menu-item')) return;
+    if (!menuItems.length || doc.querySelector('.lom-menu-item')) return;
     // prefer sitting right below the Settings entry; fall back to above Exit
     const settingsItem = menuItems.find((el) => /^settings$/i.test(el.textContent?.trim() ?? ''));
     const exitItem = menuItems[menuItems.length - 1];
@@ -264,11 +248,6 @@ function SettingsContent() {
     const setUI = (patch: Partial<typeof ui>) => {
         updateUISettings(patch);
         flushStore();
-        // the root-menu popup is retained for the whole session, so the menu
-        // entry has to be added/removed live
-        if ('showSteamMenuItem' in patch) {
-            applySteamMenuItem(rootMenuPopup).catch(() => { /* popup not seen yet */ });
-        }
         bump((n) => n + 1);
     };
 
@@ -281,9 +260,9 @@ function SettingsContent() {
     const accentFill = `rgb(${m.slice(1).map((c) => Math.round(parseInt(c, 16) * 0.7)).join(', ')})`;
 
     const pillStyle = (active: boolean): React.CSSProperties => ({
-        padding: '4px 14px', borderRadius: '12px', cursor: 'pointer', fontSize: '13px',
+        padding: '4px 14px', borderRadius: '8px', cursor: 'pointer', fontSize: '13px',
         border: `1px solid ${active ? accentFill : 'rgba(255,255,255,0.2)'}`,
-        background: active ? accentFill : 'transparent',
+        background: active ? accentFill : 'rgba(255,255,255,0.07)',
         color: active ? '#fff' : 'inherit',
     });
 
@@ -295,15 +274,6 @@ function SettingsContent() {
                     Check <code>lom-store.json</code> in the plugin directory (a backup may exist as <code>lom-store.json.bak</code>).
                 </div>
             )}
-            <Field label="Game page button" description="Show the 🔧 button next to the ⚙ button on every game's library page" bottomSeparator="standard" focusable>
-                <Toggle value={ui.showAppButton} onChange={(v: boolean) => setUI({ showAppButton: v })} />
-            </Field>
-            <Field label="Properties dialog button" description="Show the small 🔧 inside the launch options field in game Properties" bottomSeparator="standard" focusable>
-                <Toggle value={ui.showPropsButton} onChange={(v: boolean) => setUI({ showPropsButton: v })} />
-            </Field>
-            <Field label="Steam menu entry" description="Add 'Launch Options' to the top-left Steam menu (opens profiles & bulk apply)" bottomSeparator="standard" focusable>
-                <Toggle value={ui.showSteamMenuItem} onChange={(v: boolean) => setUI({ showSteamMenuItem: v })} />
-            </Field>
             <Field label="GPU vendor" description="Grays out presets meant for the other vendor; Auto probes the drivers, Disabled turns the hints off" bottomSeparator="standard" focusable>
                 <div style={{ display: 'flex', gap: '6px' }}>
                     {([['auto', 'Auto-detect'], ['amd', 'AMD'], ['nvidia', 'NVIDIA'], ['off', 'Disabled']] as const).map(([value, label]) => (
@@ -359,29 +329,7 @@ function SettingsContent() {
                             if (res.ok) setAccentDraft(getUISettings().accentColor || DEFAULT_ACCENT);
                             bump((n) => n + 1);
                         }}>Restore from file…</button>
-                </div>
-            </Field>
-            <Field label="Restore previous state" description="Swap the plugin's data file with its automatic previous generation (lom-store.json.bak). Running it again swaps back." bottomSeparator="standard" focusable>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                    <button
-                        style={pillStyle(restoreState === 'confirm')}
-                        onClick={async () => {
-                            if (restoreState === 'working') return;
-                            if (restoreState !== 'confirm') {
-                                setRestoreState('confirm');
-                                setRestoreMsg('');
-                                setTimeout(() => setRestoreState((st) => (st === 'confirm' ? 'idle' : st)), 4000);
-                                return;
-                            }
-                            setRestoreState('working');
-                            const res = await restoreBackup();
-                            setRestoreState(res.ok ? 'done' : 'failed');
-                            setRestoreMsg(res.ok ? 'Restored — previous state is now the backup' : `Failed: ${res.reason}`);
-                            if (res.ok) setAccentDraft(getUISettings().accentColor || DEFAULT_ACCENT);
-                            bump((n) => n + 1);
-                        }}
-                    >{restoreState === 'confirm' ? 'Click again to confirm' : restoreState === 'working' ? 'Restoring…' : 'Restore'}</button>
-                    {restoreMsg && <span style={{ fontSize: '12px', color: restoreState === 'failed' ? '#f04a4a' : '#24a65a' }}>{restoreMsg}</span>}
+                    {restoreMsg && <span style={{ fontSize: '12px', alignSelf: 'center', color: restoreState === 'failed' ? '#f04a4a' : '#24a65a' }}>{restoreMsg}</span>}
                 </div>
             </Field>
             <p style={{ opacity: 0.7 }}>

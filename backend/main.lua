@@ -224,11 +224,24 @@ function GetProtonDBReports(a_appid)
         local responses = report.responses
         local lo = responses and responses.launchOptions
         if type(lo) == "string" and lo ~= "" then
+            local note = responses.concludingNotes
+            if type(note) ~= "string" then
+                note = ""
+            elseif #note > 280 then
+                -- cut on a UTF-8 character boundary: a mid-sequence cut would
+                -- produce invalid text that breaks the IPC decode downstream
+                local cut = 277
+                while cut > 1 and note:byte(cut + 1) and note:byte(cut + 1) >= 0x80 and note:byte(cut + 1) < 0xC0 do
+                    cut = cut - 1
+                end
+                note = note:sub(1, cut) .. "..."
+            end
             table.insert(compact, {
                 lo = lo,
                 ts = report.timestamp or 0,
                 proton = (responses.protonVersion ~= nil and tostring(responses.protonVersion)) or "",
                 verdict = (responses.verdict ~= nil and tostring(responses.verdict)) or "",
+                note = note,
             })
         end
     end
@@ -239,6 +252,33 @@ function GetProtonDBReports(a_appid)
     end
     pdb_cache[appid] = { ts = counts.timestamp, payload = payload }
     return payload
+end
+
+-- Tier summary (platinum/gold/...) from the public summaries endpoint.
+local summary_cache = {}
+
+function GetProtonDBSummary(a_appid)
+    local appid = tonumber(a_appid)
+    if not appid then
+        return '{"__error":"bad appid"}'
+    end
+    if summary_cache[appid] then
+        return summary_cache[appid]
+    end
+    local resp, err = http.get(
+        "https://www.protondb.com/api/v1/reports/summaries/" .. intstr(appid) .. ".json",
+        { timeout = 15 })
+    if not resp or resp.status ~= 200 then
+        logger:warn("ProtonDB summary fetch failed: " .. tostring(err or (resp and resp.status)))
+        return '{"__error":"no summary"}'
+    end
+    local ok, data = pcall(json.decode, resp.body)
+    if not ok or type(data) ~= "table" or type(data.tier) ~= "string" then
+        logger:warn("ProtonDB summary payload invalid for appid " .. intstr(appid))
+        return '{"__error":"no summary"}'
+    end
+    summary_cache[appid] = resp.body
+    return resp.body
 end
 
 local function on_load()
