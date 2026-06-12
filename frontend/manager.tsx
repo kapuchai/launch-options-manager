@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { DialogButton } from '@steambrew/client';
-import { ArgItem, ArgKind, composeLaunchOptions, makeItem, tokenize } from './model';
+import { ArgItem, ArgKind, GpuVendor, composeLaunchOptions, detectConflicts, makeItem, tokenize } from './model';
 import { PRESETS, Preset } from './presets';
 import {
     Capabilities,
@@ -15,6 +15,7 @@ import {
     getUserCollections,
     deleteProfile,
     isShortcut,
+    loadStore,
     onSaveFailure,
     persistenceBlocked,
     saveProfile,
@@ -50,10 +51,10 @@ interface PaletteExtra {
 }
 
 const FALLBACK: Palette & PaletteExtra = {
-    bg: '#171d25',
-    panel: '#1f2630',
-    panelHover: '#252d39',
-    border: '#2e3744',
+    bg: '#1e242c',
+    panel: '#28303a',
+    panelHover: '#2f3845',
+    border: 'rgba(255,255,255,0.09)',
     text: '#dcdedf',
     muted: '#8b929a',
     accent: '#1a9fff',
@@ -61,15 +62,24 @@ const FALLBACK: Palette & PaletteExtra = {
     red: '#d94126',
     yellow: '#e8a33d',
     mono: '"DejaVu Sans Mono", Consolas, monospace',
-    input: 'rgba(0,0,0,0.35)',
-    header: '#252d39',
+    input: '#161b21',
+    header: '#2f3845',
     accentHover: '#3eb1ff',
 };
+
+// '#rrggbb' → lightened toward white by `amount` (0..1)
+function lighten(hex: string, amount: number): string {
+    const m = hex.match(/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i);
+    if (!m) return hex;
+    const mix = (c: string) => Math.min(255, Math.round(parseInt(c, 16) * (1 - amount) + 255 * amount));
+    return `rgb(${mix(m[1])}, ${mix(m[2])}, ${mix(m[3])})`;
+}
 
 // Adapt to the active Millennium theme: SpaceTheme (and themes following its
 // convention) define --st-* RGB-triplet variables; Millennium itself injects
 // --SystemAccentColor*. Anything missing falls back to a Steam-like dark look.
-function readPalette(doc: Document): Palette {
+function readPalette(doc: Document, accentOverride?: string): Palette {
+    let palette = FALLBACK;
     try {
         const root = getComputedStyle(doc.documentElement);
         const triplet = (name: string): string | null => {
@@ -81,30 +91,33 @@ function readPalette(doc: Document): Palette {
             return t ? `rgb(${t})` : fallback;
         };
         const themed = triplet('--st-background') !== null || triplet('--st-accent-1') !== null;
-        if (!themed) return FALLBACK;
-        const bodyColor = getComputedStyle(doc.body).color;
-        // SpaceTheme layering: background (10,10,10) sits behind everything;
-        // visible surfaces are the grays color-1..6. Using the grays — not the
-        // near-black background — matches how the rest of the theme looks.
-        return {
-            bg: rgb('--st-color-1', FALLBACK.bg),
-            panel: rgb('--st-color-2', FALLBACK.panel),
-            panelHover: rgb('--st-color-5', FALLBACK.panelHover),
-            border: rgb('--st-color-6', FALLBACK.border),
-            text: bodyColor && bodyColor !== 'rgba(0, 0, 0, 0)' ? bodyColor : FALLBACK.text,
-            muted: FALLBACK.muted,
-            accent: rgb('--st-accent-1', rgb('--SystemAccentColor-RGB', FALLBACK.accent)),
-            accentHover: rgb('--st-accent-2', rgb('--st-accent-1', FALLBACK.accentHover)),
-            green: rgb('--st-green', FALLBACK.green),
-            red: rgb('--st-red', FALLBACK.red),
-            yellow: rgb('--st-yellow', FALLBACK.yellow),
-            mono: FALLBACK.mono,
-            input: rgb('--st-color-3', FALLBACK.input),
-            header: rgb('--st-color-5', FALLBACK.header),
-        };
-    } catch {
-        return FALLBACK;
+        if (themed) {
+            const bodyColor = getComputedStyle(doc.body).color;
+            // SpaceTheme layering: the near-black --st-background sits behind
+            // everything; the lighter grays color-2/5 are the visible
+            // surfaces, so the manager builds on those.
+            palette = {
+                bg: rgb('--st-color-2', FALLBACK.bg),
+                panel: rgb('--st-color-5', FALLBACK.panel),
+                panelHover: rgb('--st-color-6', FALLBACK.panelHover),
+                border: 'rgba(255,255,255,0.09)',
+                text: bodyColor && bodyColor !== 'rgba(0, 0, 0, 0)' ? bodyColor : FALLBACK.text,
+                muted: FALLBACK.muted,
+                accent: rgb('--st-accent-1', rgb('--SystemAccentColor-RGB', FALLBACK.accent)),
+                accentHover: rgb('--st-accent-2', rgb('--st-accent-1', FALLBACK.accentHover)),
+                green: rgb('--st-green', FALLBACK.green),
+                red: rgb('--st-red', FALLBACK.red),
+                yellow: rgb('--st-yellow', FALLBACK.yellow),
+                mono: FALLBACK.mono,
+                input: rgb('--st-color-1', FALLBACK.input),
+                header: rgb('--st-color-6', FALLBACK.header),
+            };
+        }
+    } catch { /* fall through to fallback */ }
+    if (accentOverride && /^#[0-9a-f]{6}$/i.test(accentOverride)) {
+        palette = { ...palette, accent: accentOverride, accentHover: lighten(accentOverride, 0.18) };
     }
+    return palette;
 }
 
 function makeStyles(C: Palette): Record<string, React.CSSProperties> {
@@ -114,27 +127,27 @@ function makeStyles(C: Palette): Record<string, React.CSSProperties> {
             background: C.bg, color: C.text, fontSize: '13px',
         },
         tabBar: { display: 'flex', gap: '2px', padding: '8px 12px 0 12px', borderBottom: `1px solid ${C.border}`, flexShrink: 0 },
-        tab: { padding: '7px 14px', cursor: 'pointer', borderRadius: '3px 3px 0 0', color: C.muted, userSelect: 'none' },
+        tab: { padding: '7px 14px', cursor: 'pointer', borderRadius: '8px 8px 0 0', color: C.muted, userSelect: 'none' },
         tabActive: { background: C.panel, color: C.text, boxShadow: `inset 0 2px 0 ${C.accent}` },
         body: { flex: 1, overflowY: 'auto', padding: '12px 16px' },
         section: { marginBottom: '16px' },
         sectionTitle: { fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.08em', color: C.muted, margin: '0 0 6px 2px' },
         row: {
             display: 'flex', alignItems: 'center', gap: '8px', padding: '5px 8px',
-            background: C.panel, borderRadius: '3px', marginBottom: '4px', border: `1px solid ${C.border}`,
+            background: C.panel, borderRadius: '8px', marginBottom: '4px', border: `1px solid ${C.border}`,
         },
         rowDisabled: { opacity: 0.55 },
         input: {
             flex: 1, background: C.input, color: C.text, border: `1px solid ${C.border}`,
-            borderRadius: '2px', padding: '5px 8px', fontFamily: C.mono, fontSize: '12px', outline: 'none', minWidth: 0,
+            borderRadius: '6px', padding: '5px 8px', fontFamily: C.mono, fontSize: '12px', outline: 'none', minWidth: 0,
         },
         iconBtn: {
             background: 'transparent', color: C.muted, border: 'none', cursor: 'pointer',
-            padding: '2px 5px', fontSize: '13px', lineHeight: 1, borderRadius: '2px',
+            padding: '2px 5px', fontSize: '13px', lineHeight: 1, borderRadius: '6px',
         },
         addBtn: {
             background: 'transparent', color: C.accent, border: `1px dashed ${C.border}`, cursor: 'pointer',
-            padding: '5px 10px', borderRadius: '3px', fontSize: '12px', width: '100%', textAlign: 'left',
+            padding: '6px 10px', borderRadius: '8px', fontSize: '12px', width: '100%', textAlign: 'left',
         },
         preview: {
             flexShrink: 0, borderTop: `2px solid ${C.accent}`, padding: '10px 16px 12px 16px',
@@ -148,7 +161,7 @@ function makeStyles(C: Palette): Record<string, React.CSSProperties> {
         knob: { position: 'absolute', top: '2px', width: '12px', height: '12px', borderRadius: '50%', background: '#fff', transition: 'left 0.15s' },
         smallBtn: {
             background: C.panel, color: C.text, border: `1px solid ${C.border}`, cursor: 'pointer',
-            padding: '4px 10px', borderRadius: '2px', fontSize: '12px',
+            padding: '4px 12px', borderRadius: '8px', fontSize: '12px',
         },
         badge: {
             fontSize: '10px', padding: '1px 6px', borderRadius: '8px', whiteSpace: 'nowrap',
@@ -157,16 +170,16 @@ function makeStyles(C: Palette): Record<string, React.CSSProperties> {
         catHeader: {
             display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', userSelect: 'none',
             padding: '8px 12px', background: C.header, borderLeft: `3px solid ${C.accent}`,
-            borderRadius: '3px', marginBottom: '4px', fontWeight: 600,
+            borderRadius: '8px', marginBottom: '4px', fontWeight: 600,
         },
         presetRow: {
             display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 8px',
-            background: 'transparent', borderRadius: '3px', marginBottom: '2px', marginLeft: '12px',
+            background: 'transparent', borderRadius: '8px', marginBottom: '2px', marginLeft: '12px',
             border: `1px solid ${C.border}`, cursor: 'pointer',
         },
         pill: {
             background: C.panel, color: C.text, border: `1px solid ${C.border}`, cursor: 'pointer',
-            padding: '4px 12px', borderRadius: '12px', fontSize: '12px',
+            padding: '4px 12px', borderRadius: '14px', fontSize: '12px',
         },
         pillActive: {
             background: C.accent, color: '#fff', border: `1px solid ${C.accent}`,
@@ -179,9 +192,14 @@ function makeStyles(C: Palette): Record<string, React.CSSProperties> {
 // <select>/<option>, whose dropdown list ignores inline colors.
 function paletteCss(C: Palette): string {
     return `
+.lom-root button { transition: filter .12s ease, background .12s ease, color .12s ease, opacity .12s ease; }
 .lom-root button:hover { filter: brightness(1.3); }
+.lom-root .lom-preset-row { transition: background .12s ease, opacity .12s ease; }
 .lom-root .lom-preset-row:hover { background: ${C.panel} !important; }
+.lom-root .lom-cat-header { transition: filter .12s ease; }
 .lom-root .lom-cat-header:hover { filter: brightness(1.15); }
+.lom-root .lom-fade { animation: lomFade .16s ease; }
+@keyframes lomFade { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
 .lom-root select { background: ${C.input}; color: ${C.text}; border: 1px solid ${C.border}; }
 .lom-root select option { background-color: ${C.panel}; color: ${C.text}; }
 .lom-root input::placeholder, .lom-root textarea::placeholder { color: ${C.muted}; }
@@ -229,6 +247,8 @@ interface RowProps {
     dragging: boolean;
     dragOver: boolean;
     canDrop: boolean;
+    autoFocusText: boolean;
+    duplicate: boolean;
     onChange: (patch: Partial<ArgItem>, immediate?: boolean) => void;
     onDelete: () => void;
     onDragStart: () => void;
@@ -238,23 +258,17 @@ interface RowProps {
 }
 
 function ItemRow(props: RowProps) {
-    const { item, dragging, dragOver, canDrop } = props;
+    const { item, dragging, dragOver, canDrop, autoFocusText, duplicate } = props;
     const { C, S } = useTheme();
     const [noteOpen, setNoteOpen] = useState(false);
-    // The row is draggable only while the ⠿ grip is pressed: a permanently
-    // draggable row hijacks mouse text selection inside its inputs (Chromium
-    // starts a row drag instead of a selection).
-    const [dragArmed, setDragArmed] = useState(false);
+    const rowRef = useRef<HTMLDivElement | null>(null);
     const showNote = noteOpen || Boolean(item.note);
 
     return (
         <div
+            ref={rowRef}
             className={`${dragging ? 'lom-dragging' : ''} ${dragOver ? 'lom-drag-over' : ''}`}
             style={{ ...S.row, flexDirection: 'column', alignItems: 'stretch', gap: '4px', ...(item.enabled ? {} : S.rowDisabled) }}
-            draggable={dragArmed}
-            onMouseUp={() => setDragArmed(false)}
-            onDragStart={(e) => { (e as any).dataTransfer?.setData('text/plain', item.id); props.onDragStart(); }}
-            onDragEnd={() => { setDragArmed(false); props.onDragEnd(); }}
             onDragOver={(e) => {
                 if (!canDrop) return; // no preventDefault → browser shows not-allowed
                 e.preventDefault();
@@ -263,20 +277,32 @@ function ItemRow(props: RowProps) {
             onDrop={(e) => { e.preventDefault(); props.onDropOnRow((e as any).dataTransfer?.getData('text/plain') || null); }}
         >
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                {/* The grip itself is the drag source: making the whole row
+                    draggable hijacks text selection in the inputs, and arming
+                    draggable on mousedown is too late for Blink (verified —
+                    the drag source is chosen at mousedown). */}
                 <span
-                    style={{ color: C.muted, cursor: 'grab', fontSize: '14px', lineHeight: 1, userSelect: 'none' }}
+                    style={{ color: C.muted, cursor: 'grab', fontSize: '14px', lineHeight: 1, userSelect: 'none', padding: '2px 2px' }}
                     title="Drag to reorder"
-                    onMouseDown={() => setDragArmed(true)}
+                    draggable
+                    onDragStart={(e) => {
+                        (e as any).dataTransfer?.setData('text/plain', item.id);
+                        if (rowRef.current) (e as any).dataTransfer?.setDragImage(rowRef.current, 20, 15);
+                        props.onDragStart();
+                    }}
+                    onDragEnd={props.onDragEnd}
                 >⠿</span>
                 <MiniToggle value={item.enabled} onChange={(enabled) => props.onChange({ enabled }, true)} />
                 <input
                     style={S.input}
                     value={item.text}
                     spellCheck={false}
+                    autoFocus={autoFocusText}
                     draggable={false}
                     onDragStart={(e) => { e.preventDefault(); e.stopPropagation(); }}
                     onChange={(e) => props.onChange({ text: (e.target as HTMLInputElement).value })}
                 />
+                {duplicate && <span style={{ ...S.badge, color: C.yellow, borderColor: C.yellow, flexShrink: 0 }} title="Another enabled row sets the same option">duplicate</span>}
                 <button style={{ ...S.iconBtn, ...(showNote ? { color: C.accent } : {}) }} title={item.note ? 'Edit note' : 'Add a note'}
                     onMouseDown={(e) => e.preventDefault()}
                     onClick={() => setNoteOpen(!noteOpen)}>✎</button>
@@ -326,8 +352,12 @@ function presetSignature(kind: ArgKind, text: string): string {
 type Tab = 'args' | 'presets' | 'profiles' | 'bulk';
 
 export function ManagerWindow({ appid }: { appid: number }) {
+    // appid 0 = standalone mode (opened from the Steam menu): no game
+    // context, only profile management and bulk apply.
+    const standalone = appid === 0;
     const [items, setItems] = useState<ArgItem[] | null>(null);
-    const [tab, setTab] = useState<Tab>('args');
+    const [tab, setTab] = useState<Tab>(standalone ? 'profiles' : 'args');
+    const [focusId, setFocusId] = useState<string | null>(null);
     const [status, setStatus] = useState<string>('');
     // semantic key, resolved against the live palette at render time — a
     // closure-captured color string would freeze the pre-theme fallback
@@ -349,7 +379,7 @@ export function ManagerWindow({ appid }: { appid: number }) {
     // empty rows) are persisted to the plugin store without a Steam write or
     // an 'Applying…' flash.
     const lastPushed = useRef<string | null>(null);
-    const gameName = useMemo(() => getGameName(appid), [appid]);
+    const gameName = useMemo(() => (standalone ? 'Profiles & bulk apply' : getGameName(appid)), [appid]);
     const { C, S } = theme;
 
     const flash = (msg: string, color: keyof Palette = 'muted', autoClear = false) => {
@@ -362,22 +392,43 @@ export function ManagerWindow({ appid }: { appid: number }) {
     };
 
     useEffect(() => {
-        // theme probe: own popout document first, falling back to defaults
+        // theme probe: own popout document first, falling back to defaults;
+        // re-applied with the user's accent override once the store loads
         const doc = rootRef.current?.ownerDocument;
-        if (doc) {
-            const palette = readPalette(doc);
+        if (!doc) return;
+        const apply = (accent?: string) => {
+            const palette = readPalette(doc, accent);
             setTheme({ C: palette, S: makeStyles(palette) });
             injectStylesheet(doc, palette);
-        }
+        };
+        apply();
+        loadStore().then(() => {
+            const accent = getUISettings().accentColor;
+            if (accent) apply(accent);
+        });
     }, []);
 
     useEffect(() => {
-        getCapabilities().then(setCaps);
+        if (!standalone) getCapabilities().then(setCaps);
         onSaveFailure((reason) => {
             flash(reason === 'loadFailed'
                 ? 'Changes are NOT saved — the plugin store file could not be read'
                 : 'Failed to save plugin data to disk', 'red');
         });
+        if (standalone) {
+            loadStore().then(() => {
+                setItems([]);
+                lastPushed.current = '';
+                if (persistenceBlocked()) {
+                    flash('Changes are NOT saved — the plugin store file could not be read', 'red');
+                }
+            });
+            return () => {
+                onSaveFailure(null);
+                if (statusTimer.current) clearTimeout(statusTimer.current);
+                flushStore();
+            };
+        }
         getGameItems(appid).then(({ items: loadedItems, liveUnknown, proton: protonFlag }) => {
             setItems(loadedItems);
             setProton(protonFlag);
@@ -487,18 +538,24 @@ export function ManagerWindow({ appid }: { appid: number }) {
     const addItem = (kind: ArgKind, text = '') => {
         const it = makeItem(kind, text);
         it.text = text; // keep untrimmed while the user is still typing
+        setFocusId(it.id);
         update([...items, it], text !== '');
     };
 
     // %command% highlighted so the structure of the final string stands out
     const previewParts = (composed || '').split('%command%');
 
-    const tabs: { id: Tab; label: string }[] = [
-        { id: 'args', label: 'Arguments' },
-        { id: 'presets', label: 'Presets' },
-        { id: 'profiles', label: 'Profiles' },
-        { id: 'bulk', label: 'Bulk apply' },
-    ];
+    const tabs: { id: Tab; label: string }[] = standalone
+        ? [
+            { id: 'profiles', label: 'Profiles' },
+            { id: 'bulk', label: 'Bulk apply' },
+        ]
+        : [
+            { id: 'args', label: 'Arguments' },
+            { id: 'presets', label: 'Presets' },
+            { id: 'profiles', label: 'Profiles' },
+            { id: 'bulk', label: 'Bulk apply' },
+        ];
 
     return (
         <ThemeCtx.Provider value={theme}>
@@ -517,26 +574,30 @@ export function ManagerWindow({ appid }: { appid: number }) {
                             {proton ? 'Proton' : 'native Linux'}
                         </div>
                     )}
+                    <span style={{ color: C[statusColor] as string, fontSize: '12px', marginLeft: 'auto' }}>{status}</span>
                 </div>
                 <div style={S.tabBar}>
                     {tabs.map((t) => (
-                        <div key={t.id} style={{ ...S.tab, ...(tab === t.id ? S.tabActive : {}) }} onClick={() => setTab(t.id)}>
+                        <div key={t.id} style={{ ...S.tab, ...(tab === t.id ? S.tabActive : {}) }}
+                            onClick={() => { setTab(t.id); setFocusId(null); }}>
                             {t.label}
                         </div>
                     ))}
                 </div>
-                <div style={S.body}>
+                <div style={S.body} className="lom-fade" key={tab}>
                     {tab === 'args' && (
-                        <ArgsTab items={items} hasRaw={hasRaw}
-                            onChange={changeItem} onDelete={deleteItem} onReorder={reorderItem} onAdd={addItem} />
+                        <ArgsTab items={items} hasRaw={hasRaw} focusId={focusId}
+                            onChange={changeItem} onDelete={deleteItem} onReorder={reorderItem} onAdd={addItem}
+                            onClearAll={() => update([], true)} />
                     )}
                     {tab === 'presets' && (
                         <PresetsTab hasRaw={hasRaw} caps={caps} proton={proton}
+                            vendor={getUISettings().gpuVendor}
                             addedExact={addedExact} addedSignatures={addedSignatures}
                             onAdd={(p) => { addItem(p.kind, p.text); flash(`Added: ${p.text}`, 'green', true); }} />
                     )}
                     {tab === 'profiles' && (
-                        <ProfilesTab items={items} flash={flash} hasRaw={hasRaw}
+                        <ProfilesTab items={items} flash={flash} hasRaw={hasRaw} standalone={standalone}
                             onLoad={(profileItems, replace) => {
                                 const copies = profileItems.map((it) => ({ ...makeItem(it.kind, it.text, it.enabled), note: it.note }));
                                 update(replace ? copies : [...items, ...copies], true);
@@ -545,12 +606,11 @@ export function ManagerWindow({ appid }: { appid: number }) {
                     )}
                     {tab === 'bulk' && <BulkTab flash={flash} currentAppid={appid} onAppliedToCurrent={adoptItems} />}
                 </div>
-                <div style={S.preview} className="lom-preview">
+                {!standalone && <div style={S.preview} className="lom-preview">
                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                         <span style={{ fontSize: '11px', color: C.accent, textTransform: 'uppercase', letterSpacing: '0.1em', fontWeight: 600 }}>
                             Current launch options
                         </span>
-                        <span style={{ color: C[statusColor] as string, fontSize: '12px', marginLeft: 'auto' }}>{status}</span>
                     </div>
                     <div style={S.previewText}>
                         {composed
@@ -562,7 +622,7 @@ export function ManagerWindow({ appid }: { appid: number }) {
                             ))
                             : <span style={{ color: C.muted }}>(empty — Steam launches the game unmodified)</span>}
                     </div>
-                </div>
+                </div>}
             </div>
         </ThemeCtx.Provider>
     );
@@ -571,17 +631,30 @@ export function ManagerWindow({ appid }: { appid: number }) {
 // ── tabs ────────────────────────────────────────────────────────────────────
 
 function ArgsTab(props: {
-    items: ArgItem[]; hasRaw: boolean;
+    items: ArgItem[]; hasRaw: boolean; focusId: string | null;
     onChange: (id: string, patch: Partial<ArgItem>, immediate?: boolean) => void;
     onDelete: (id: string) => void;
     onReorder: (dragId: string, targetId: string) => void;
     onAdd: (kind: ArgKind, text?: string) => void;
+    onClearAll: () => void;
 }) {
-    const { items, hasRaw, onChange, onDelete, onReorder, onAdd } = props;
+    const { items, hasRaw, focusId, onChange, onDelete, onReorder, onAdd, onClearAll } = props;
     const { C, S } = useTheme();
     const [dragId, setDragId] = useState<string | null>(null);
     const [overId, setOverId] = useState<string | null>(null);
+    const [confirmClear, setConfirmClear] = useState(false);
     const dragKind = dragId ? items.find((it) => it.id === dragId)?.kind ?? null : null;
+
+    // Same option set twice among ENABLED rows (env vars by name,
+    // wrappers/flags by first token) — flagged with a badge.
+    const sigCounts = new Map<string, number>();
+    for (const it of items) {
+        if (!it.enabled || !it.text.trim() || it.kind === 'raw') continue;
+        const sig = presetSignature(it.kind, it.text);
+        sigCounts.set(sig, (sigCounts.get(sig) ?? 0) + 1);
+    }
+    const isDuplicate = (it: ArgItem) =>
+        it.enabled && Boolean(it.text.trim()) && it.kind !== 'raw' && (sigCounts.get(presetSignature(it.kind, it.text)) ?? 0) > 1;
 
     if (hasRaw) {
         const raw = items.find((it) => it.kind === 'raw')!;
@@ -610,8 +683,17 @@ function ArgsTab(props: {
         );
     }
 
+    const conflicts = detectConflicts(items);
+
     return (
         <div>
+            {conflicts.length > 0 && (
+                <div style={{ ...S.section, border: `1px solid ${C.yellow}`, borderRadius: '8px', padding: '8px 12px' }}>
+                    {conflicts.map((w) => (
+                        <div key={w} style={{ color: C.yellow, fontSize: '12px', lineHeight: 1.6 }}>⚠ {w}</div>
+                    ))}
+                </div>
+            )}
             {KIND_SECTIONS.map((sec) => {
                 const sectionItems = items.filter((it) => it.kind === sec.kind);
                 return (
@@ -622,6 +704,8 @@ function ArgsTab(props: {
                                 dragging={dragId === it.id}
                                 dragOver={overId === it.id && dragId !== null && dragId !== it.id}
                                 canDrop={dragId === null || dragKind === sec.kind}
+                                autoFocusText={focusId === it.id}
+                                duplicate={isDuplicate(it)}
                                 onChange={(patch, immediate) => onChange(it.id, patch, immediate)}
                                 onDelete={() => onDelete(it.id)}
                                 onDragStart={() => setDragId(it.id)}
@@ -636,22 +720,40 @@ function ArgsTab(props: {
                                     setOverId(null);
                                 }} />
                         ))}
-                        <button style={S.addBtn} onClick={() => onAdd(sec.kind)}>+ add (e.g. {sec.placeholder})</button>
+                        <button style={S.addBtn} onClick={() => onAdd(sec.kind)}>+ add</button>
                     </div>
                 );
             })}
+            {items.length > 0 && (
+                <button
+                    style={{ ...S.smallBtn, color: C.red, marginTop: '4px' }}
+                    onClick={() => {
+                        if (!confirmClear) {
+                            setConfirmClear(true);
+                            setTimeout(() => setConfirmClear(false), 2500);
+                            return;
+                        }
+                        setConfirmClear(false);
+                        onClearAll();
+                    }}
+                >{confirmClear ? 'Click again to remove everything' : 'Clear all arguments'}</button>
+            )}
         </div>
     );
 }
 
-// Why a preset may not work here; null = no objection.
-function presetIssue(p: Preset, caps: Capabilities | null, proton: boolean | null): string | null {
+// Why a preset may not work here; null = no objection. The user's GPU choice
+// in plugin settings overrides the driver probe.
+function presetIssue(p: Preset, caps: Capabilities | null, proton: boolean | null, vendor: GpuVendor): string | null {
+    const nvidia = vendor === 'nvidia' ? true : vendor === 'amd' ? false : caps ? caps.nvidia : null;
+    const amd = vendor === 'amd' ? true : vendor === 'nvidia' ? false : caps ? caps.amd : null;
+    const intel = vendor === 'auto' ? (caps ? caps.intel : null) : false;
     if (p.bin && caps && caps.bins[p.bin] === false) return `${p.bin} is not installed`;
     if (p.proton && proton === false) return 'Proton games only — this game runs natively';
-    if (p.gpu === 'nvidia' && caps && !caps.nvidia) return 'NVIDIA driver not detected';
-    if (p.gpu === 'amd' && caps && caps.nvidia && !caps.amd) return 'AMD-only option';
+    if (p.gpu === 'nvidia' && nvidia === false) return 'NVIDIA-only option';
+    if (p.gpu === 'amd' && amd === false && nvidia) return 'AMD-only option';
     // Mesa drives AMD and Intel GPUs; only flag when neither is present
-    if (p.gpu === 'mesa' && caps && caps.nvidia && !caps.amd && !caps.intel) return 'Mesa option — no Mesa GPU detected';
+    if (p.gpu === 'mesa' && nvidia && amd === false && !intel) return 'Mesa option — no Mesa GPU detected';
     return null;
 }
 
@@ -660,10 +762,11 @@ function PresetsTab(props: {
     hasRaw: boolean;
     caps: Capabilities | null;
     proton: boolean | null;
+    vendor: GpuVendor;
     addedExact: Set<string>;
     addedSignatures: Set<string>;
 }) {
-    const { onAdd, hasRaw, caps, proton, addedExact, addedSignatures } = props;
+    const { onAdd, hasRaw, caps, proton, vendor, addedExact, addedSignatures } = props;
     const { C, S } = useTheme();
     const [filter, setFilter] = useState('');
     const [openCats, setOpenCats] = useState<string[]>(() => getUISettings().openCategories);
@@ -714,7 +817,7 @@ function PresetsTab(props: {
                         {open && catPresets.map((p) => {
                             const exact = addedExact.has(presetExactKey(p.kind, p.text));
                             const similar = !exact && addedSignatures.has(presetSignature(p.kind, p.text));
-                            const issue = presetIssue(p, caps, proton);
+                            const issue = presetIssue(p, caps, proton, vendor);
                             const expanded = expandedPreset === p.text;
                             return (
                                 <div key={p.text} className="lom-preset-row" style={{ ...S.presetRow, flexDirection: 'column', alignItems: 'stretch', gap: '4px', ...(issue ? { opacity: 0.65 } : {}) }}
@@ -759,10 +862,11 @@ function PresetsTab(props: {
 function ProfilesTab(props: {
     items: ArgItem[];
     hasRaw: boolean;
+    standalone: boolean;
     flash: (msg: string, color?: keyof Palette, autoClear?: boolean) => void;
     onLoad: (items: ArgItem[], replace: boolean) => void;
 }) {
-    const { items, hasRaw, flash, onLoad } = props;
+    const { items, hasRaw, standalone, flash, onLoad } = props;
     const { C, S } = useTheme();
     const [name, setName] = useState('');
     const [, bump] = useState(0);
@@ -771,12 +875,16 @@ function ProfilesTab(props: {
     return (
         <div>
             <div style={{ ...S.section, color: C.muted, lineHeight: 1.6 }}>
-                A profile is a named, reusable set of arguments. Build the set you like on the
-                <b> Arguments</b> tab, save it here, then <b>Load</b> it onto any other game (replacing its
-                arguments) or <b>+ Merge</b> it on top of them. <b>Bulk apply</b> writes a profile to many
-                games at once. Profiles are copies — editing a game later doesn't change the profile.
+                {standalone
+                    ? <>A profile is a named, reusable set of launch arguments, saved from a game's launch
+                        options manager. Use <b>Bulk apply</b> to write one to many games at once.
+                        Profiles are copies — editing a game later doesn't change the profile.</>
+                    : <>A profile is a named, reusable set of arguments. Build the set you like on the
+                        <b> Arguments</b> tab, save it here, then <b>Load</b> it onto any other game (replacing its
+                        arguments) or <b>+ Merge</b> it on top of them. <b>Bulk apply</b> writes a profile to many
+                        games at once. Profiles are copies — editing a game later doesn't change the profile.</>}
             </div>
-            <div style={S.section}>
+            {!standalone && <div style={S.section}>
                 <div style={S.sectionTitle}>Save current arguments as a profile</div>
                 <div style={{ display: 'flex', gap: '8px' }}>
                     <input
@@ -796,10 +904,14 @@ function ProfilesTab(props: {
                         }}
                     >Save</DialogButton>
                 </div>
-            </div>
+            </div>}
             <div style={S.section}>
                 <div style={S.sectionTitle}>Profiles</div>
-                {!profiles.length && <div style={{ color: C.muted }}>No profiles yet. Save one above.</div>}
+                {!profiles.length && <div style={{ color: C.muted }}>
+                    {standalone
+                        ? "No profiles yet. Open a game's launch options manager and save one from its Profiles tab."
+                        : 'No profiles yet. Save one above.'}
+                </div>}
                 {profiles.map((p) => (
                     <div key={p.name} style={S.row}>
                         <div style={{ flex: 1, minWidth: 0 }}>
@@ -808,15 +920,15 @@ function ProfilesTab(props: {
                                 {composeLaunchOptions(p.items) || '(empty)'}
                             </div>
                         </div>
-                        <button style={S.smallBtn} title="Replace this game's arguments with the profile"
-                            onClick={() => onLoad(p.items, true)}>Load</button>
-                        <button
+                        {!standalone && <button style={S.smallBtn} title="Replace this game's arguments with the profile"
+                            onClick={() => onLoad(p.items, true)}>Load</button>}
+                        {!standalone && <button
                             style={{ ...S.smallBtn, ...(hasRaw ? { opacity: 0.4, cursor: 'default' } : {}) }}
                             disabled={hasRaw}
                             title={hasRaw
                                 ? 'Unavailable in raw mode — merged items would be ignored by the raw string'
                                 : "Add the profile's arguments on top of the current ones"}
-                            onClick={() => { if (!hasRaw) onLoad(p.items, false); }}>+ Merge</button>
+                            onClick={() => { if (!hasRaw) onLoad(p.items, false); }}>+ Merge</button>}
                         <button style={{ ...S.iconBtn, color: C.red }} title="Delete profile"
                             onClick={() => { deleteProfile(p.name); bump((n) => n + 1); }}>✕</button>
                     </div>
@@ -836,11 +948,20 @@ function BulkTab(props: {
     const [profileName, setProfileName] = useState('');
     const [filter, setFilter] = useState('');
     const [selected, setSelected] = useState<Set<number>>(new Set());
-    // Which pill made the current selection; clicking it again clears it.
-    const [activeSource, setActiveSource] = useState<string | null>(null);
+    // Pills that contributed to the selection; multiple can be active and the
+    // selection is their union. Clicking an active pill removes its set.
+    const [activeSources, setActiveSources] = useState<Set<string>>(new Set());
     const games = useMemo(() => getAllGames(), []);
     const collections = useMemo(() => getUserCollections(), []);
     const profiles = getProfiles();
+
+    const sourceSets = useMemo(() => {
+        const m = new Map<string, number[]>();
+        m.set('all', games.map((g) => g.appid));
+        m.set('installed', games.filter((g) => g.installed).map((g) => g.appid));
+        for (const c of collections) m.set(c.id, c.appids);
+        return m;
+    }, [games, collections]);
 
     const lower = filter.toLowerCase();
     const visible = games.filter((g) => !lower || g.name.toLowerCase().includes(lower));
@@ -850,18 +971,17 @@ function BulkTab(props: {
         if (next.has(appid)) next.delete(appid);
         else next.add(appid);
         setSelected(next);
-        // manual edits mean the selection no longer equals the pill's set
-        setActiveSource(null);
     };
 
-    const togglePill = (id: string, appids: number[]) => {
-        if (activeSource === id) {
-            setSelected(new Set());
-            setActiveSource(null);
-        } else {
-            setSelected(new Set(appids));
-            setActiveSource(id);
-        }
+    const togglePill = (id: string) => {
+        const nextSources = new Set(activeSources);
+        if (nextSources.has(id)) nextSources.delete(id);
+        else nextSources.add(id);
+        setActiveSources(nextSources);
+        // recompute as the union of all active pills (manual tweaks reset)
+        const union = new Set<number>();
+        for (const sid of nextSources) for (const a of sourceSets.get(sid) ?? []) union.add(a);
+        setSelected(union);
     };
 
     const apply = () => {
@@ -882,7 +1002,7 @@ function BulkTab(props: {
         flushStore();
         flash(`Profile applied to ${ok} game${ok === 1 ? '' : 's'}`, 'green', true);
         setSelected(new Set());
-        setActiveSource(null);
+        setActiveSources(new Set());
     };
 
     return (
@@ -905,18 +1025,18 @@ function BulkTab(props: {
                     Games <span style={{ opacity: 0.6 }}>— {selected.size} selected; replaces their launch options</span>
                 </div>
                 <div style={{ display: 'flex', gap: '6px', marginBottom: '8px', flexWrap: 'wrap' }}>
-                    <button style={{ ...S.pill, ...(activeSource === 'all' ? S.pillActive : {}) }}
-                        onClick={() => togglePill('all', games.map((g) => g.appid))}>All games</button>
-                    <button style={{ ...S.pill, ...(activeSource === 'installed' ? S.pillActive : {}) }}
-                        onClick={() => togglePill('installed', games.filter((g) => g.installed).map((g) => g.appid))}>All installed</button>
+                    <button style={{ ...S.pill, ...(activeSources.has('all') ? S.pillActive : {}) }}
+                        onClick={() => togglePill('all')}>All games</button>
+                    <button style={{ ...S.pill, ...(activeSources.has('installed') ? S.pillActive : {}) }}
+                        onClick={() => togglePill('installed')}>All installed</button>
                     {collections.map((c) => (
-                        <button key={c.id} style={{ ...S.pill, ...(activeSource === c.id ? S.pillActive : {}) }}
-                            title={`Select the "${c.name}" collection (${c.appids.length} games); click again to clear`}
-                            onClick={() => togglePill(c.id, c.appids)}>{c.name}</button>
+                        <button key={c.id} style={{ ...S.pill, ...(activeSources.has(c.id) ? S.pillActive : {}) }}
+                            title={`Toggle the "${c.name}" collection (${c.appids.length} games) in the selection`}
+                            onClick={() => togglePill(c.id)}>{c.name}</button>
                     ))}
                     {selected.size > 0 && (
                         <button style={{ ...S.pill, color: C.muted }}
-                            onClick={() => { setSelected(new Set()); setActiveSource(null); }}>✕ Clear</button>
+                            onClick={() => { setSelected(new Set()); setActiveSources(new Set()); }}>✕ Clear</button>
                     )}
                 </div>
                 <input

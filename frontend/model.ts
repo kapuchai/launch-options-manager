@@ -31,18 +31,27 @@ export interface Profile {
     items: ArgItem[];
 }
 
+export type GpuVendor = 'auto' | 'amd' | 'nvidia';
+
 export interface UISettings {
     showAppButton: boolean;
     showPropsButton: boolean;
+    showSteamMenuItem: boolean;
     openCategories: string[];
     defaultProfileSeeded: boolean;
+    // '' = use the theme's accent; otherwise a #rrggbb override
+    accentColor: string;
+    gpuVendor: GpuVendor;
 }
 
 export const defaultUISettings = (): UISettings => ({
     showAppButton: true,
     showPropsButton: true,
+    showSteamMenuItem: true,
     openCategories: [],
     defaultProfileSeeded: false,
+    accentColor: '',
+    gpuVendor: 'auto',
 });
 
 export interface Store {
@@ -191,6 +200,36 @@ export function composeLaunchOptions(items: ArgItem[]): string {
     if (parts.length) parts.push(COMMAND_TOKEN);
     parts.push(...flags);
     return parts.join(' ');
+}
+
+// Known-bad combinations among the enabled items, surfaced as warnings in
+// the editor (rules from the Linux gaming community's collective scar tissue).
+export function detectConflicts(items: ArgItem[]): string[] {
+    const enabled = items.filter((it) => it.enabled && it.text.trim() && it.kind !== 'raw');
+    const warnings: string[] = [];
+    const firstTok = (it: ArgItem) => tokenize(it.text)[0] ?? '';
+    const hasWrapper = (name: string) => enabled.some((it) => it.kind === 'wrapper' && firstTok(it) === name);
+    const hasEnv = (name: string) => enabled.some((it) => it.kind === 'env' && it.text.startsWith(`${name}=`));
+
+    const gamescope = enabled.find((it) => it.kind === 'wrapper' && firstTok(it) === 'gamescope');
+    if (gamescope) {
+        if (hasWrapper('mangohud') || hasEnv('MANGOHUD')) {
+            warnings.push('MangoHud does not work under gamescope — use "gamescope --mangoapp" instead');
+        }
+        if (!/--$/.test(gamescope.text.trim())) {
+            warnings.push('gamescope should end with "--" so the game command is not parsed as gamescope flags');
+        }
+    }
+    if (hasWrapper('gamemoderun') && hasWrapper('game-performance')) {
+        warnings.push('gamemoderun and game-performance overlap — one is enough');
+    }
+    if (hasEnv('PROTON_ENABLE_HDR') && !hasEnv('PROTON_ENABLE_WAYLAND')) {
+        warnings.push('PROTON_ENABLE_HDR=1 needs PROTON_ENABLE_WAYLAND=1 to work');
+    }
+    if (hasEnv('PROTON_LOG') && hasEnv('WINEDEBUG')) {
+        warnings.push('WINEDEBUG=-all silences the log that PROTON_LOG=1 is trying to capture');
+    }
+    return warnings;
 }
 
 // Reconcile stored items with the launch options string currently in Steam.

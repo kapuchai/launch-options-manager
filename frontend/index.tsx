@@ -15,13 +15,16 @@ declare const MainWindowBrowserManager: any;
 const WaitForElementTimeout = async (sel: string, parent: any = document, timeOut = 2000) =>
     [...(await Millennium.findElement(parent, sel, timeOut))][0] as HTMLElement;
 
+const WaitForElementList = async (sel: string, parent: any = document, timeOut = 3000) =>
+    [...(await Millennium.findElement(parent, sel, timeOut))] as HTMLElement[];
+
 let openModal: { Close: () => void } | null = null;
 
 function openManager(triggerPopup: any, appid: number) {
     const parentWindow = (getMainWindowPopup() ?? triggerPopup)?.m_popup?.window;
     try { openModal?.Close(); } catch { /* already closed */ }
     openModal = showModal(<ManagerWindow appid={appid} />, parentWindow, {
-        strTitle: `Launch Options — ${getGameName(appid)}`,
+        strTitle: appid ? `Launch Options — ${getGameName(appid)}` : 'Launch Options — Profiles & Bulk apply',
         bForcePopOut: true,
         bHideMainWindowForPopouts: false,
         popupWidth: 980,
@@ -55,7 +58,7 @@ function maybeInjectAppButton(popup: any): void {
 
     const lomButton = gameSettingsButton.cloneNode(true) as HTMLElement;
     lomButton.classList.add('lom-button');
-    (lomButton.firstChild as HTMLElement).innerHTML = '⚡';
+    (lomButton.firstChild as HTMLElement).innerHTML = '🔧';
     lomButton.title = 'Launch Options Manager';
     gameSettingsButton.parentNode!.insertBefore(lomButton, gameSettingsButton.nextSibling);
     console.error('[launch-options-manager] app page button injected (diagnostic, not an error)');
@@ -106,7 +109,7 @@ async function injectPropertiesButton(popup: any, panel: HTMLElement, appid: num
 
     const button = doc.createElement('button');
     button.className = 'lom-props-button';
-    button.textContent = '⚡';
+    button.textContent = '🔧';
     button.title = 'Open Launch Options Manager';
     button.addEventListener('click', (e) => {
         e.preventDefault();
@@ -129,7 +132,7 @@ async function injectPropertiesButton(popup: any, panel: HTMLElement, appid: num
         button.style.cssText =
             'align-self:flex-end;background:transparent;border:none;color:inherit;opacity:0.55;'
             + 'cursor:pointer;font-size:12px;padding:0;line-height:1.4;text-decoration:underline;';
-        button.textContent = '⚡ Launch Options Manager…';
+        button.textContent = '🔧 Launch Options Manager…';
         dialogBody.appendChild(button);
     }
 }
@@ -190,15 +193,54 @@ async function OnPopupCreation(popup: any) {
         });
     } else if (popup.m_strName?.startsWith('PopupWindow_')) {
         watchPropertiesDialog(popup).catch(() => { /* not a game properties dialog */ });
+    } else if (popup.m_strTitle === 'Steam Root Menu') {
+        rootMenuPopup = popup;
+        applySteamMenuItem(popup).catch((e) =>
+            console.error('[launch-options-manager] steam menu inject failed', e));
     }
+}
+
+// The root menu popup is created hidden ONCE per session and retained
+// (show/hide), so it's remembered for live add/remove when the setting flips.
+let rootMenuPopup: any = null;
+
+// Text entry in the top-left Steam menu, opening the standalone manager
+// (profiles + bulk apply). Same clone pattern as steam-librarian's
+// restart entry. Idempotent: also removes the item when the setting is off.
+async function applySteamMenuItem(popup: any) {
+    if (!popup?.m_popup?.document) return;
+    // the settings must come from the real store, not pre-load defaults — the
+    // menu popup is created during the same startup burst as plugin init
+    await loadStore();
+    const doc = popup.m_popup.document;
+    const existing = doc.querySelector('.lom-menu-item');
+    if (!getUISettings().showSteamMenuItem) {
+        existing?.remove();
+        return;
+    }
+    if (existing) return;
+    const menuItems = await WaitForElementList("div#popup_target div[role='menuitem']", doc, 3000);
+    if (!menuItems.length || doc.querySelector('.lom-menu-item')) return;
+    const exitItem = menuItems[menuItems.length - 1];
+    const item = exitItem.cloneNode(true) as HTMLElement;
+    item.classList.add('lom-menu-item');
+    item.textContent = 'Launch Options';
+    exitItem.parentNode!.insertBefore(item, exitItem);
+    item.addEventListener('click', () => openManager(getMainWindowPopup(), 0));
 }
 
 // ── Millennium settings panel ───────────────────────────────────────────────
 
 function SettingsContent() {
     const [ready, setReady] = useState(false);
+    const [accentDraft, setAccentDraft] = useState('');
     const [, bump] = useState(0);
-    useEffect(() => { loadStore().then(() => setReady(true)); }, []);
+    useEffect(() => {
+        loadStore().then(() => {
+            setAccentDraft(getUISettings().accentColor);
+            setReady(true);
+        });
+    }, []);
     if (!ready) return <div>Loading…</div>;
 
     const ui = getUISettings();
@@ -207,8 +249,24 @@ function SettingsContent() {
     const setUI = (patch: Partial<typeof ui>) => {
         updateUISettings(patch);
         flushStore();
+        // the root-menu popup is retained for the whole session, so the menu
+        // entry has to be added/removed live
+        if ('showSteamMenuItem' in patch) {
+            applySteamMenuItem(rootMenuPopup).catch(() => { /* popup not seen yet */ });
+        }
         bump((n) => n + 1);
     };
+
+    // accept '666cff' as '#666cff'; '' clears the override
+    const normalizedAccent = /^[0-9a-f]{6}$/i.test(accentDraft) ? `#${accentDraft}` : accentDraft;
+    const accentValid = normalizedAccent === '' || /^#[0-9a-f]{6}$/i.test(normalizedAccent);
+
+    const pillStyle = (active: boolean): React.CSSProperties => ({
+        padding: '4px 14px', borderRadius: '12px', cursor: 'pointer', fontSize: '13px',
+        border: `1px solid ${active ? '#666cff' : 'rgba(255,255,255,0.2)'}`,
+        background: active ? '#666cff' : 'transparent',
+        color: active ? '#fff' : 'inherit',
+    });
 
     return (
         <div style={{ lineHeight: 1.6 }}>
@@ -218,11 +276,47 @@ function SettingsContent() {
                     Check <code>lom-store.json</code> in the plugin directory (a backup may exist as <code>lom-store.json.bak</code>).
                 </div>
             )}
-            <Field label="Game page button" description="Show the ⚡ button next to the ⚙ button on every game's library page" bottomSeparator="standard" focusable>
+            <Field label="Game page button" description="Show the 🔧 button next to the ⚙ button on every game's library page" bottomSeparator="standard" focusable>
                 <Toggle value={ui.showAppButton} onChange={(v: boolean) => setUI({ showAppButton: v })} />
             </Field>
-            <Field label="Properties dialog link" description="Show the small 'Launch Options Manager…' link in game Properties → General" bottomSeparator="standard" focusable>
+            <Field label="Properties dialog button" description="Show the small 🔧 inside the launch options field in game Properties" bottomSeparator="standard" focusable>
                 <Toggle value={ui.showPropsButton} onChange={(v: boolean) => setUI({ showPropsButton: v })} />
+            </Field>
+            <Field label="Steam menu entry" description="Add 'Launch Options' to the top-left Steam menu (opens profiles & bulk apply)" bottomSeparator="standard" focusable>
+                <Toggle value={ui.showSteamMenuItem} onChange={(v: boolean) => setUI({ showSteamMenuItem: v })} />
+            </Field>
+            <Field label="GPU vendor" description="Used to gray out presets meant for the other vendor; Auto probes the installed drivers" bottomSeparator="standard" focusable>
+                <div style={{ display: 'flex', gap: '6px' }}>
+                    {([['auto', 'Auto-detect'], ['amd', 'AMD'], ['nvidia', 'NVIDIA']] as const).map(([value, label]) => (
+                        <button key={value} style={pillStyle(ui.gpuVendor === value)}
+                            onClick={() => setUI({ gpuVendor: value })}>{label}</button>
+                    ))}
+                </div>
+            </Field>
+            <Field label="Accent color" description="Hex color for the manager's interactive elements (e.g. #666cff); leave empty to follow the theme" bottomSeparator="standard" focusable>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <div style={{
+                        width: '18px', height: '18px', borderRadius: '4px', flexShrink: 0,
+                        background: /^#[0-9a-f]{6}$/i.test(normalizedAccent) ? normalizedAccent : 'transparent',
+                        border: '1px solid rgba(255,255,255,0.25)',
+                    }} />
+                    <input
+                        value={accentDraft}
+                        placeholder="#666cff"
+                        spellCheck={false}
+                        style={{
+                            width: '90px', padding: '4px 8px', fontFamily: 'monospace', borderRadius: '6px',
+                            background: '#161b21', color: '#dcdedf', border: '1px solid rgba(255,255,255,0.2)',
+                        }}
+                        onChange={(e) => {
+                            const v = (e.target as HTMLInputElement).value.trim();
+                            setAccentDraft(v);
+                            const norm = /^[0-9a-f]{6}$/i.test(v) ? `#${v}` : v;
+                            if (norm === '' || /^#[0-9a-f]{6}$/i.test(norm)) setUI({ accentColor: norm });
+                        }}
+                    />
+                    {!accentValid && <span style={{ color: '#f04a4a', fontSize: '11px' }}>invalid hex</span>}
+                </div>
             </Field>
             <p style={{ opacity: 0.7 }}>
                 {games.length} game{games.length === 1 ? '' : 's'} with managed options · {store.profiles.length} profile{store.profiles.length === 1 ? '' : 's'}
