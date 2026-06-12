@@ -5,13 +5,24 @@ local utils = require("utils")
 local http = require("http")
 local json = require("json")
 
+local is_windows = package.config:sub(1, 1) == "\\"
+
 -- User data lives OUTSIDE the plugin folder: plugin updates replace the
 -- install directory wholesale, which must never take the store with it.
-local data_home = utils.getenv("XDG_DATA_HOME")
-if not data_home or data_home == "" then
-    data_home = (utils.getenv("HOME") or "") .. "/.local/share"
+local DATA_DIR
+if is_windows then
+    local appdata = utils.getenv("APPDATA")
+    if not appdata or appdata == "" then
+        appdata = (utils.getenv("USERPROFILE") or "") .. "/AppData/Roaming"
+    end
+    DATA_DIR = appdata .. "/launch-options-manager"
+else
+    local data_home = utils.getenv("XDG_DATA_HOME")
+    if not data_home or data_home == "" then
+        data_home = (utils.getenv("HOME") or "") .. "/.local/share"
+    end
+    DATA_DIR = data_home .. "/launch-options-manager"
 end
-local DATA_DIR = data_home .. "/launch-options-manager"
 fs.create_directories(DATA_DIR)
 
 STORE_PATH = DATA_DIR .. "/lom-store.json"
@@ -164,8 +175,9 @@ local PROBE_BINS = {
 
 local function bin_exists(name)
     local path_env = utils.getenv("PATH") or ""
-    for dir in string.gmatch(path_env, "[^:]+") do
-        if fs.exists(dir .. "/" .. name) then
+    local sep = is_windows and ";" or ":"
+    for dir in string.gmatch(path_env, "[^" .. sep .. "]+") do
+        if fs.exists(dir .. "/" .. name) or (is_windows and fs.exists(dir .. "/" .. name .. ".exe")) then
             return true
         end
     end

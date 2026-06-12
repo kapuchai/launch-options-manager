@@ -48,8 +48,8 @@ npm install --legacy-peer-deps && npm run build
 
 ## Data
 
-Your data lives in `~/.local/share/launch-options-manager/` as plain JSON, outside the plugin
-folder, so plugin updates never touch it. Steam only ever sees the composed launch-options
+Your data lives outside the plugin folder as plain JSON — `~/.local/share/launch-options-manager/`
+on Linux, `%APPDATA%\launch-options-manager\` on Windows — so plugin updates never touch it. Steam only ever sees the composed launch-options
 string — uninstalling the plugin leaves your games exactly as configured.
 
 ## License
