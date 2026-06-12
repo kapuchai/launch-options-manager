@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { Field, IconsModule, Millennium, Toggle, definePlugin, findModule, showModal, sleep } from '@steambrew/client';
-import { ManagerWindow } from './manager';
+import { DEFAULT_ACCENT, ManagerWindow, downloadText, pickTextFile } from './manager';
 import { composeLaunchOptions } from './model';
-import { flushStore, getGameName, getStore, getUISettings, loadStore, persistenceBlocked, restoreBackup, updateUISettings } from './store';
+import { flushStore, getGameName, getStore, getUISettings, loadStore, persistenceBlocked, replaceStoreFromText, restoreBackup, serializeStore, updateUISettings } from './store';
 import { getMainWindowPopup, setMainWindowPopup } from './windows';
 
 declare const uiStore: any;
@@ -251,7 +251,8 @@ function SettingsContent() {
     const [, bump] = useState(0);
     useEffect(() => {
         loadStore().then(() => {
-            setAccentDraft(getUISettings().accentColor);
+            // show the effective accent, not an empty field
+            setAccentDraft(getUISettings().accentColor || DEFAULT_ACCENT);
             setReady(true);
         });
     }, []);
@@ -274,11 +275,15 @@ function SettingsContent() {
     // accept '666cff' as '#666cff'; '' clears the override
     const normalizedAccent = /^[0-9a-f]{6}$/i.test(accentDraft) ? `#${accentDraft}` : accentDraft;
     const accentValid = normalizedAccent === '' || /^#[0-9a-f]{6}$/i.test(normalizedAccent);
+    const effectiveAccent = /^#[0-9a-f]{6}$/i.test(ui.accentColor) ? ui.accentColor : DEFAULT_ACCENT;
+    // dimmed fill, mirroring the manager's accentDim
+    const m = effectiveAccent.match(/^#(..)(..)(..)$/)!;
+    const accentFill = `rgb(${m.slice(1).map((c) => Math.round(parseInt(c, 16) * 0.7)).join(', ')})`;
 
     const pillStyle = (active: boolean): React.CSSProperties => ({
         padding: '4px 14px', borderRadius: '12px', cursor: 'pointer', fontSize: '13px',
-        border: `1px solid ${active ? '#666cff' : 'rgba(255,255,255,0.2)'}`,
-        background: active ? '#666cff' : 'transparent',
+        border: `1px solid ${active ? accentFill : 'rgba(255,255,255,0.2)'}`,
+        background: active ? accentFill : 'transparent',
         color: active ? '#fff' : 'inherit',
     });
 
@@ -326,13 +331,37 @@ function SettingsContent() {
                             const v = (e.target as HTMLInputElement).value.trim();
                             setAccentDraft(v);
                             const norm = /^[0-9a-f]{6}$/i.test(v) ? `#${v}` : v;
-                            if (norm === '' || /^#[0-9a-f]{6}$/i.test(norm)) setUI({ accentColor: norm });
+                            if (norm === '' || /^#[0-9a-f]{6}$/i.test(norm)) {
+                                // explicit values are stored verbatim — only an
+                                // emptied field means "follow the theme accent"
+                                setUI({ accentColor: norm });
+                            }
                         }}
                     />
                     {!accentValid && <span style={{ color: '#f04a4a', fontSize: '11px' }}>invalid hex</span>}
                 </div>
             </Field>
-            <Field label="Restore from backup" description="Swap the plugin's data file with its previous generation (lom-store.json.bak). Running it again swaps back." bottomSeparator="standard" focusable>
+            <Field label="Back up / restore" description="Save all plugin data (arguments, notes, profiles, settings) to a file, or restore from a previously saved one" bottomSeparator="standard" focusable>
+                <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                    <button style={pillStyle(false)}
+                        onClick={(e) => {
+                            const text = serializeStore();
+                            if (!text) { setRestoreMsg('Nothing to back up — store failed to load'); setRestoreState('failed'); return; }
+                            downloadText((e.currentTarget as HTMLElement).ownerDocument, 'launch-options-backup.json', text);
+                        }}>Back up to file…</button>
+                    <button style={pillStyle(false)}
+                        onClick={async (e) => {
+                            const text = await pickTextFile((e.currentTarget as HTMLElement).ownerDocument);
+                            if (text === null) return;
+                            const res = await replaceStoreFromText(text);
+                            setRestoreState(res.ok ? 'done' : 'failed');
+                            setRestoreMsg(res.ok ? 'Restored from file' : `Failed: ${res.reason}`);
+                            if (res.ok) setAccentDraft(getUISettings().accentColor || DEFAULT_ACCENT);
+                            bump((n) => n + 1);
+                        }}>Restore from file…</button>
+                </div>
+            </Field>
+            <Field label="Restore previous state" description="Swap the plugin's data file with its automatic previous generation (lom-store.json.bak). Running it again swaps back." bottomSeparator="standard" focusable>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                     <button
                         style={pillStyle(restoreState === 'confirm')}
@@ -348,6 +377,7 @@ function SettingsContent() {
                             const res = await restoreBackup();
                             setRestoreState(res.ok ? 'done' : 'failed');
                             setRestoreMsg(res.ok ? 'Restored — previous state is now the backup' : `Failed: ${res.reason}`);
+                            if (res.ok) setAccentDraft(getUISettings().accentColor || DEFAULT_ACCENT);
                             bump((n) => n + 1);
                         }}
                     >{restoreState === 'confirm' ? 'Click again to confirm' : restoreState === 'working' ? 'Restoring…' : 'Restore'}</button>
@@ -357,14 +387,6 @@ function SettingsContent() {
             <p style={{ opacity: 0.7 }}>
                 {games.length} game{games.length === 1 ? '' : 's'} with managed options · {store.profiles.length} profile{store.profiles.length === 1 ? '' : 's'}
             </p>
-            {games.map((key) => (
-                <div key={key} style={{ fontSize: '12px', opacity: 0.8, marginBottom: '4px' }}>
-                    <b>{getGameName(parseInt(key, 10))}</b>
-                    <div style={{ fontFamily: 'monospace', wordBreak: 'break-all' }}>
-                        {composeLaunchOptions(store.games[key].items) || '(all disabled)'}
-                    </div>
-                </div>
-            ))}
         </div>
     );
 }

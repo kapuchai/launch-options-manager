@@ -4,6 +4,6 @@
     "name": "launch-options-manager",
     "common_name": "Launch Options Manager",
     "description": "Structured editor for game launch options: toggleable args, presets, profiles and bulk apply.",
-    "version": "0.5.0",
+    "version": "0.6.0",
     "backendType": "lua"
 }

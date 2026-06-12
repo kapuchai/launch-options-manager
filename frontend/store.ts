@@ -9,8 +9,6 @@ declare const collectionStore: any;
 const backendGetStore = callable<[], string>('GetStore');
 const backendSetStore = callable<[{ a_json: string }], string>('SetStore');
 const backendGetCapabilities = callable<[], string>('GetCapabilities');
-const backendExportProfiles = callable<[{ a_json: string }], string>('ExportProfiles');
-const backendReadProfilesFile = callable<[], string>('ReadProfilesFile');
 const backendRestoreBackup = callable<[], string>('RestoreBackup');
 
 let store: Store = emptyStore();
@@ -39,6 +37,25 @@ export function loadStore(): Promise<Store> {
     return loadPromise;
 }
 
+// Build a well-formed Store from untrusted parsed JSON: per-entry shape
+// checks so a hand-edited or truncated file can never crash a render.
+function normalizeStore(parsed: any): Store {
+    const games: Record<string, GameConfig> = {};
+    if (parsed.games && typeof parsed.games === 'object' && !Array.isArray(parsed.games)) {
+        for (const [key, cfg] of Object.entries<any>(parsed.games)) {
+            if (cfg && typeof cfg === 'object' && Array.isArray(cfg.items)) games[key] = cfg;
+        }
+    }
+    const profiles: Profile[] = (Array.isArray(parsed.profiles) ? parsed.profiles : [])
+        .filter((p: any) => p && typeof p.name === 'string' && Array.isArray(p.items));
+    return {
+        version: 1,
+        games,
+        profiles,
+        ui: { ...defaultUISettings(), ...(parsed.ui && typeof parsed.ui === 'object' && !Array.isArray(parsed.ui) ? parsed.ui : {}) },
+    };
+}
+
 async function doLoadStore(): Promise<Store> {
     try {
         const raw = String((await backendGetStore()) ?? '');
@@ -49,12 +66,7 @@ async function doLoadStore(): Promise<Store> {
             console.error('[launch-options-manager] Backend could not read the store file — persistence disabled');
             loadFailed = true;
         } else if (parsed && parsed.version === 1) {
-            store = {
-                version: 1,
-                games: parsed.games && typeof parsed.games === 'object' && !Array.isArray(parsed.games) ? parsed.games : {},
-                profiles: Array.isArray(parsed.profiles) ? parsed.profiles : [],
-                ui: { ...defaultUISettings(), ...(parsed.ui && typeof parsed.ui === 'object' ? parsed.ui : {}) },
-            };
+            store = normalizeStore(parsed);
         } else {
             console.error('[launch-options-manager] Store has unexpected content — refusing to overwrite it', parsed?.version);
             loadFailed = true;
@@ -418,31 +430,21 @@ export async function fetchProtonDBReports(appid: number): Promise<PDBResult> {
 
 // ── Profile export / import / backup restore ───────────────────────────────
 
-export interface ExportResult { ok: boolean; path?: string; }
-
-export async function exportProfiles(): Promise<ExportResult> {
-    // with a failed store load the in-memory profile list is empty — writing
-    // it out would clobber a possibly-good previous export with nothing
-    if (persistenceBlocked() || !store.profiles.length) return { ok: false };
-    try {
-        const payload = JSON.stringify({ launchOptionsManagerProfiles: 1, profiles: store.profiles }, null, 2);
-        const res = JSON.parse(String(await backendExportProfiles({ a_json: payload })));
-        return { ok: res?.ok === true, path: res?.path };
-    } catch (e) {
-        console.error('[launch-options-manager] export failed', e);
-        return { ok: false };
-    }
+// JSON text for a profiles export file; null when there is nothing safe to
+// export (failed store load would serialize an empty list).
+export function serializeProfiles(): string | null {
+    if (persistenceBlocked() || !store.profiles.length) return null;
+    return JSON.stringify({ launchOptionsManagerProfiles: 1, profiles: store.profiles }, null, 2);
 }
 
 export interface ImportResult { ok: boolean; added: number; renamed: number; skipped: number; error?: string; }
 
-export async function importProfiles(): Promise<ImportResult> {
+export async function importProfilesFromText(raw: string): Promise<ImportResult> {
     const fail = (error: string): ImportResult => ({ ok: false, added: 0, renamed: 0, skipped: 0, error });
     try {
-        const raw = String(await backendReadProfilesFile());
+        await loadStore();
         const parsed = JSON.parse(raw);
-        if (parsed?.__missing) return fail(`no file found — place it at ${parsed.path ?? 'the plugin directory'}`);
-        if (parsed?.__readError) return fail('the profiles file could not be read');
+        // accept a full store backup as a profile source too
         const incoming: Profile[] = Array.isArray(parsed) ? parsed : parsed?.profiles;
         if (!Array.isArray(incoming)) return fail('not a profiles export (expected { profiles: [...] })');
         if (persistenceBlocked()) return fail('the plugin store failed to load — imports cannot be saved (try Restore from backup first)');
@@ -479,6 +481,39 @@ export async function importProfiles(): Promise<ImportResult> {
         console.error('[launch-options-manager] import failed', e);
         return fail('the file is not valid JSON');
     }
+}
+
+// JSON text of the full store, for "back up to file".
+export function serializeStore(): string | null {
+    if (persistenceBlocked()) return null;
+    return JSON.stringify(store, null, 2);
+}
+
+// Replace the whole store from user-chosen file content (full-store backups
+// only; profile-only files are rejected with a pointer to Import).
+export async function replaceStoreFromText(raw: string): Promise<{ ok: boolean; reason?: string }> {
+    let parsed: any;
+    try {
+        parsed = JSON.parse(raw);
+    } catch {
+        return { ok: false, reason: 'not valid JSON' };
+    }
+    if (!parsed || parsed.version !== 1 || !parsed.games || typeof parsed.games !== 'object' || Array.isArray(parsed.games)) {
+        if (parsed?.launchOptionsManagerProfiles) {
+            return { ok: false, reason: 'this is a profiles export — use Import in the Profiles tab instead' };
+        }
+        return { ok: false, reason: 'not a Launch Options Manager store backup' };
+    }
+    if (saveTimer) {
+        clearTimeout(saveTimer);
+        saveTimer = null;
+    }
+    store = normalizeStore(parsed);
+    loadFailed = false;
+    loadPromise = Promise.resolve(store);
+    storeGeneration++;
+    const saved = await flushStore();
+    return saved ? { ok: true } : { ok: false, reason: 'could not write the restored data to disk' };
 }
 
 // Bumped whenever the in-memory store is rebuilt from disk (restore); open

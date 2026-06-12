@@ -15,10 +15,10 @@ import {
     getUISettings,
     getUserCollections,
     deleteProfile,
-    exportProfiles,
     fetchProtonDBReports,
-    importProfiles,
+    importProfilesFromText,
     PDBResult,
+    serializeProfiles,
     isShortcut,
     loadStore,
     onSaveFailure,
@@ -63,16 +63,20 @@ const FALLBACK: Palette & PaletteExtra = {
     border: 'rgba(255,255,255,0.09)',
     text: '#dcdedf',
     muted: '#8b929a',
-    accent: '#1a9fff',
+    accent: '#666cff',
     green: '#5ba32b',
     red: '#d94126',
     yellow: '#e8a33d',
     mono: '"DejaVu Sans Mono", Consolas, monospace',
     input: '#161b21',
     header: '#2f3845',
-    accentHover: '#3eb1ff',
-    accentDim: 'rgb(17, 104, 167)',
+    accentHover: '#878cff',
+    accentDim: 'rgb(72, 76, 179)',
 };
+
+// the accent every UI element should follow when the theme doesn't provide
+// one — exported so the settings panel can show/use the effective value
+export const DEFAULT_ACCENT = '#666cff';
 
 // parse '#rrggbb' or 'rgb(r, g, b)' into channels
 function parseColor(color: string): [number, number, number] | null {
@@ -200,7 +204,7 @@ function makeStyles(C: Palette): Record<string, React.CSSProperties> {
         },
         presetRow: {
             display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 8px',
-            background: 'transparent', borderRadius: '8px', marginBottom: '2px', marginLeft: '12px',
+            background: C.panel, borderRadius: '8px', marginBottom: '3px', marginLeft: '12px',
             border: `1px solid ${C.border}`, cursor: 'pointer',
         },
         pill: {
@@ -221,7 +225,7 @@ function paletteCss(C: Palette): string {
 .lom-root button { transition: filter .12s ease, background .12s ease, color .12s ease, opacity .12s ease; }
 .lom-root button:hover { filter: brightness(1.3); }
 .lom-root .lom-preset-row { transition: background .12s ease, opacity .12s ease; }
-.lom-root .lom-preset-row:hover { background: ${C.panel} !important; }
+.lom-root .lom-preset-row:hover { background: ${C.panelHover} !important; }
 .lom-root .lom-cat-header { transition: filter .12s ease; }
 .lom-root .lom-cat-header:hover { filter: brightness(1.15); }
 .lom-root .lom-fade { animation: lomFade .16s ease; }
@@ -249,6 +253,58 @@ function injectStylesheet(doc: Document, C: Palette): void {
     } catch (e) {
         console.error('[launch-options-manager] stylesheet injection failed', e);
     }
+}
+
+// Save text via the browser download path (CEF shows the save dialog / drops
+// it in the downloads folder) — gives the user a real file destination.
+export function downloadText(doc: Document, filename: string, text: string): void {
+    const blob = new Blob([text], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = doc.createElement('a');
+    a.href = url;
+    a.download = filename;
+    doc.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+// Open the OS file picker and resolve with the chosen file's text
+// (null = cancelled).
+export function pickTextFile(doc: Document): Promise<string | null> {
+    return new Promise((resolve) => {
+        const input = doc.createElement('input');
+        input.type = 'file';
+        input.accept = '.json,application/json';
+        input.style.display = 'none';
+        doc.body.appendChild(input);
+        const win = doc.defaultView;
+        let settled = false;
+        const settle = async (file: File | undefined) => {
+            if (settled) return;
+            settled = true;
+            input.remove();
+            win?.removeEventListener('focus', onFocus, true);
+            if (!file) {
+                resolve(null);
+                return;
+            }
+            try {
+                resolve(await file.text());
+            } catch (e) {
+                console.error('[launch-options-manager] reading picked file failed', e);
+                resolve(null);
+            }
+        };
+        // A cancelled dialog never fires 'change'. Chromium 113+ fires
+        // 'cancel'; the focus fallback covers anything older — the delay lets
+        // a real 'change' win the race after the dialog closes.
+        const onFocus = () => setTimeout(() => settle(input.files?.[0]), 400);
+        input.addEventListener('change', () => settle(input.files?.[0]));
+        input.addEventListener('cancel', () => settle(undefined));
+        win?.addEventListener('focus', onFocus, true);
+        input.click();
+    });
 }
 
 const ThemeCtx = createContext<{ C: Palette; S: Record<string, React.CSSProperties> }>({ C: FALLBACK, S: makeStyles(FALLBACK) });
@@ -389,6 +445,11 @@ export function ManagerWindow({ appid }: { appid: number }) {
     // Store generation at load time — if a backup restore replaced the store
     // while this window is open, its state is stale and must not be persisted.
     const storeGen = useRef(getStoreGeneration());
+    // Undo/redo over the item list. Typing is coalesced (one entry per pause)
+    // so a keystroke doesn't become an undo step.
+    const undoStack = useRef<ArgItem[][]>([]);
+    const redoStack = useRef<ArgItem[][]>([]);
+    const lastHistoryPush = useRef(0);
     const gameName = useMemo(() => (standalone ? 'Profiles & bulk apply' : getGameName(appid)), [appid]);
     const { C, S } = theme;
 
@@ -470,7 +531,18 @@ export function ManagerWindow({ appid }: { appid: number }) {
     }, [appid]);
 
     // Persist + push to Steam, debounced so typing doesn't write partial args.
-    const update = (next: ArgItem[], immediate = false) => {
+    const update = (next: ArgItem[], immediate = false, fromHistory = false) => {
+        if (!fromHistory && items) {
+            const now = Date.now();
+            // any divergent edit invalidates redo, snapshotted or not
+            redoStack.current = [];
+            // structural ops always snapshot; typing coalesces within 800ms
+            if (immediate || now - lastHistoryPush.current > 800) {
+                undoStack.current.push(items);
+                if (undoStack.current.length > 50) undoStack.current.shift();
+            }
+            lastHistoryPush.current = now;
+        }
         setItems(next);
         pendingItems.current = next;
         if (applyTimer.current) clearTimeout(applyTimer.current);
@@ -504,6 +576,20 @@ export function ManagerWindow({ appid }: { appid: number }) {
         else applyTimer.current = setTimeout(run, 600);
     };
 
+    const undo = () => {
+        if (!items || !undoStack.current.length) return;
+        redoStack.current.push(items);
+        lastHistoryPush.current = 0; // next edit must snapshot the restored state
+        update(undoStack.current.pop()!, true, true);
+    };
+
+    const redo = () => {
+        if (!items || !redoStack.current.length) return;
+        undoStack.current.push(items);
+        lastHistoryPush.current = 0;
+        update(redoStack.current.pop()!, true, true);
+    };
+
     // Replace the editor state without re-applying (the caller already wrote
     // to Steam) — used when bulk apply targets the game that is open here.
     const adoptItems = (next: ArgItem[]) => {
@@ -511,6 +597,12 @@ export function ManagerWindow({ appid }: { appid: number }) {
         applyTimer.current = null;
         pendingItems.current = null;
         runSeq.current++;
+        if (items) {
+            undoStack.current.push(items);
+            if (undoStack.current.length > 50) undoStack.current.shift();
+            redoStack.current = [];
+            lastHistoryPush.current = Date.now();
+        }
         lastPushed.current = composeLaunchOptions(next);
         setItems(next);
     };
@@ -550,6 +642,9 @@ export function ManagerWindow({ appid }: { appid: number }) {
         const it = makeItem(kind, text);
         it.text = text; // keep untrimmed while the user is still typing
         setFocusId(it.id);
+        // a row addition is structural — force a snapshot even though an
+        // empty row uses the debounced (non-immediate) apply path
+        lastHistoryPush.current = 0;
         update([...items, it], text !== '');
     };
 
@@ -587,6 +682,18 @@ export function ManagerWindow({ appid }: { appid: number }) {
                         </div>
                     )}
                     <span style={{ color: C[statusColor] as string, fontSize: '12px', marginLeft: 'auto' }}>{status}</span>
+                    {!standalone && (
+                        <span style={{ display: 'flex', gap: '2px' }}>
+                            <button
+                                style={{ ...S.iconBtn, fontSize: '15px', ...(undoStack.current.length ? {} : { opacity: 0.3, cursor: 'default' }) }}
+                                title="Undo (revert the last change, including applied ProtonDB/profile sets)"
+                                onClick={undo}>↶</button>
+                            <button
+                                style={{ ...S.iconBtn, fontSize: '15px', ...(redoStack.current.length ? {} : { opacity: 0.3, cursor: 'default' }) }}
+                                title="Redo"
+                                onClick={redo}>↷</button>
+                        </span>
+                    )}
                 </div>
                 <div style={S.tabBar}>
                     {tabs.map((t) => (
@@ -992,22 +1099,28 @@ function ProfilesTab(props: {
                 <div style={{ display: 'flex', alignItems: 'baseline', gap: '8px' }}>
                     <div style={S.sectionTitle}>Profiles</div>
                     <div style={{ marginLeft: 'auto', display: 'flex', gap: '6px' }}>
-                        <button style={S.smallBtn} title="Write all profiles to lom-profiles.json in the plugin directory"
-                            onClick={async () => {
-                                const res = await exportProfiles();
-                                if (res.ok) flash(`Exported to ${res.path}`, 'green');
-                                else flash('Export failed — see console', 'red');
-                            }}>Export file</button>
-                        <button style={S.smallBtn} title="Import profiles from lom-profiles.json in the plugin directory"
-                            onClick={async () => {
-                                const res = await importProfiles();
+                        <button style={S.smallBtn} title="Save all profiles as a JSON file"
+                            onClick={(e) => {
+                                const text = serializeProfiles();
+                                if (!text) {
+                                    flash('Nothing to export', 'yellow');
+                                    return;
+                                }
+                                downloadText((e.currentTarget as HTMLElement).ownerDocument, 'launch-options-profiles.json', text);
+                                flash('Profiles exported', 'green', true);
+                            }}>Export…</button>
+                        <button style={S.smallBtn} title="Import profiles from a JSON file"
+                            onClick={async (e) => {
+                                const text = await pickTextFile((e.currentTarget as HTMLElement).ownerDocument);
+                                if (text === null) return; // cancelled
+                                const res = await importProfilesFromText(text);
                                 if (!res.ok) flash(`Import failed: ${res.error}`, 'red');
                                 else {
                                     flash(`Imported ${res.added + res.renamed} profile${res.added + res.renamed === 1 ? '' : 's'}`
                                         + `${res.renamed ? ` (${res.renamed} renamed)` : ''}${res.skipped ? `, ${res.skipped} already present` : ''}`, 'green');
                                     bump((n) => n + 1);
                                 }
-                            }}>Import file</button>
+                            }}>Import…</button>
                     </div>
                 </div>
                 {!profiles.length && <div style={{ color: C.muted }}>
@@ -1050,6 +1163,7 @@ function ProtonDBTab(props: {
     const { C, S } = useTheme();
     const [result, setResult] = useState<PDBResult | null>(null);
     const [expanded, setExpanded] = useState<string | null>(null);
+    const [sort, setSort] = useState<'popular' | 'newest'>('popular');
 
     useEffect(() => {
         fetchProtonDBReports(appid).then(setResult);
@@ -1080,15 +1194,24 @@ function ProtonDBTab(props: {
         return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
     };
 
+    const sorted = [...result.groups].sort(sort === 'popular'
+        ? (a, b) => b.count - a.count || b.latest - a.latest
+        : (a, b) => b.latest - a.latest || b.count - a.count);
+
     return (
         <div>
             <div style={{ ...S.section, color: C.muted, lineHeight: 1.6 }}>
                 Launch options used by ProtonDB reporters for this game ({result.totalReports} reports total,
-                {' '}{result.groups.reduce((n, g) => n + g.count, 0)} with launch options), most used first.
-                <b> Use</b> replaces your current arguments — your previous set stays in the plugin store until
-                you edit further, and disabled rows are kept either way.
+                {' '}{result.groups.reduce((n, g) => n + g.count, 0)} with launch options).
+                <b> Use</b> replaces your current arguments (undo ↶ reverts); disabled rows are kept.
             </div>
-            {result.groups.slice(0, 40).map((g) => {
+            <div style={{ display: 'flex', gap: '6px', marginBottom: '10px' }}>
+                <button style={{ ...S.pill, ...(sort === 'popular' ? S.pillActive : {}) }}
+                    onClick={() => setSort('popular')}>Most used</button>
+                <button style={{ ...S.pill, ...(sort === 'newest' ? S.pillActive : {}) }}
+                    onClick={() => setSort('newest')}>Newest</button>
+            </div>
+            {sorted.slice(0, 40).map((g) => {
                 const isOpen = expanded === g.lo;
                 return (
                     <div key={g.lo} className="lom-preset-row"
