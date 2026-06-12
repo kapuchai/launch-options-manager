@@ -31,6 +31,8 @@ import {
     updateUISettings,
 } from './store';
 
+declare const SteamClient: any;
+
 // ── theme ───────────────────────────────────────────────────────────────────
 
 interface Palette {
@@ -441,7 +443,6 @@ export function ManagerWindow({ appid }: { appid: number }) {
     const [statusColor, setStatusColor] = useState<keyof Palette>('muted');
     const [caps, setCaps] = useState<Capabilities | null>(null);
     const [proton, setProton] = useState<boolean | null>(null);
-    const [pdbTier, setPdbTier] = useState<string | null>(null);
     const [theme, setTheme] = useState<{ C: Palette; S: Record<string, React.CSSProperties> }>(
         () => ({ C: FALLBACK, S: makeStyles(FALLBACK) }));
     const rootRef = useRef<HTMLDivElement | null>(null);
@@ -518,9 +519,6 @@ export function ManagerWindow({ appid }: { appid: number }) {
         getGameItems(appid).then(({ items: loadedItems, liveUnknown, proton: protonFlag }) => {
             setItems(loadedItems);
             setProton(protonFlag);
-            if (protonFlag && !isShortcut(appid)) {
-                fetchProtonDBSummary(appid).then((sum) => setPdbTier(sum?.tier ?? null));
-            }
             lastPushed.current = composeLaunchOptions(loadedItems);
             if (persistenceBlocked()) {
                 flash('Changes are NOT saved — the plugin store file could not be read', 'red');
@@ -701,15 +699,6 @@ export function ManagerWindow({ appid }: { appid: number }) {
                             {proton ? 'Proton' : 'native Linux'}
                         </div>
                     )}
-                    {pdbTier && (
-                        <div style={{
-                            ...S.badge,
-                            background: PDB_TIER_COLORS[pdbTier] ?? S.badge.background,
-                            color: '#1a1a1a', fontWeight: 600, border: 'none',
-                        }} title="Community compatibility rating from protondb.com">
-                            ProtonDB: {pdbTier}
-                        </div>
-                    )}
                 </div>
                 <div style={S.tabBar}>
                     {tabs.map((t) => (
@@ -758,6 +747,8 @@ export function ManagerWindow({ appid }: { appid: number }) {
                     {tab === 'protondb' && (
                         <ProtonDBTab appid={appid} flash={flash}
                             onUse={(lo) => {
+                                // stash the current set as the personal baseline
+                                if (items.length) saveProfile('Default', items);
                                 const parsed = parseLaunchOptions(lo);
                                 // keep existing disabled rows — unless the new
                                 // string is raw-mode, where they'd be hidden
@@ -765,6 +756,9 @@ export function ManagerWindow({ appid }: { appid: number }) {
                                     ? []
                                     : items.filter((it) => !it.enabled && it.kind !== 'raw');
                                 update([...parsed, ...keepDisabled], true);
+                                flash(items.length
+                                    ? 'Applied — your previous set was saved to the Default profile'
+                                    : 'Community launch options applied', 'green', true);
                                 setTab('args');
                             }} />
                     )}
@@ -1246,27 +1240,74 @@ function ProtonDBTab(props: {
     const [result, setResult] = useState<PDBResult | null>(null);
     const [expanded, setExpanded] = useState<string | null>(null);
     const [sort, setSort] = useState<'popular' | 'newest'>('popular');
+    const [tier, setTier] = useState<string | null>(null);
+    const [confirmOpen, setConfirmOpen] = useState(false);
 
     useEffect(() => {
         fetchProtonDBReports(appid).then(setResult);
+        fetchProtonDBSummary(appid).then((sum) => setTier(sum?.tier ?? null));
     }, [appid]);
+
+    const openWebPage = () => {
+        if (!confirmOpen) {
+            setConfirmOpen(true);
+            setTimeout(() => setConfirmOpen(false), 3500);
+            return;
+        }
+        setConfirmOpen(false);
+        try {
+            if (typeof SteamClient?.System?.OpenInSystemBrowser === 'function') {
+                SteamClient.System.OpenInSystemBrowser(`https://www.protondb.com/app/${appid}`);
+            } else {
+                flash('Could not open the browser — SteamClient API unavailable', 'red');
+            }
+        } catch (e) {
+            console.error('[launch-options-manager] open browser failed', e);
+            flash('Could not open the browser', 'red');
+        }
+    };
+
+    const toolbar = (
+        <div style={{ display: 'flex', gap: '6px', marginBottom: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
+            <button style={{ ...S.pill, ...(sort === 'popular' ? S.pillActive : {}) }}
+                onClick={() => setSort('popular')}>Most used</button>
+            <button style={{ ...S.pill, ...(sort === 'newest' ? S.pillActive : {}) }}
+                onClick={() => setSort('newest')}>Newest</button>
+            <span style={{ marginLeft: 'auto', display: 'flex', gap: '6px', alignItems: 'center' }}>
+                {tier && (
+                    <span style={{
+                        ...S.badge,
+                        background: PDB_TIER_COLORS[tier] ?? (S.badge.background as string),
+                        color: '#1a1a1a', fontWeight: 600, border: 'none', fontSize: '11px',
+                    }} title="Community compatibility rating from protondb.com">{tier}</span>
+                )}
+                <button style={S.pill} title="Open this game's page on protondb.com in your web browser"
+                    onClick={openWebPage}>{confirmOpen ? 'Open in browser?' : 'protondb.com ↗'}</button>
+            </span>
+        </div>
+    );
 
     if (!result) {
         return <div style={{ color: C.muted }}>Fetching community reports from ProtonDB…</div>;
     }
     if (result.error) {
         return (
-            <div style={{ color: C.muted, lineHeight: 1.6 }}>
-                Could not load ProtonDB reports: {result.error}.
-                <br />The reports are also browsable at protondb.com.
+            <div>
+                {toolbar}
+                <div style={{ color: C.muted, lineHeight: 1.6 }}>
+                    Could not load ProtonDB reports: {result.error}.
+                </div>
             </div>
         );
     }
     if (!result.groups.length) {
         return (
-            <div style={{ color: C.muted }}>
-                None of the {result.totalReports} ProtonDB report{result.totalReports === 1 ? '' : 's'} for this
-                game include launch options.
+            <div>
+                {toolbar}
+                <div style={{ color: C.muted }}>
+                    None of the {result.totalReports} ProtonDB report{result.totalReports === 1 ? '' : 's'} for this
+                    game include launch options.
+                </div>
             </div>
         );
     }
@@ -1282,12 +1323,7 @@ function ProtonDBTab(props: {
 
     return (
         <div>
-            <div style={{ display: 'flex', gap: '6px', marginBottom: '10px' }}>
-                <button style={{ ...S.pill, ...(sort === 'popular' ? S.pillActive : {}) }}
-                    onClick={() => setSort('popular')}>Most used</button>
-                <button style={{ ...S.pill, ...(sort === 'newest' ? S.pillActive : {}) }}
-                    onClick={() => setSort('newest')}>Newest</button>
-            </div>
+            {toolbar}
             {sorted.slice(0, 40).map((g) => {
                 const isOpen = expanded === g.lo;
                 return (
@@ -1305,7 +1341,6 @@ function ProtonDBTab(props: {
                                 onClick={(e) => {
                                     e.stopPropagation();
                                     onUse(g.lo);
-                                    flash('Community launch options applied', 'green', true);
                                 }}>Use</button>
                         </div>
                         {isOpen && (

@@ -84,7 +84,11 @@ const KNOWN_WRAPPERS = new Set([
     'primusrun',
     'optirun',
     'obs-gamecapture',
+    'obs-vkcapture',
     'strangle',
+    'scb',
+    'steamtinkerlaunch',
+    'mangoapp',
     'nice',
     'taskset',
     'firejail',
@@ -147,13 +151,10 @@ export function parseLaunchOptions(raw: string): ArgItem[] {
 
     const items: ArgItem[] = [];
 
-    // Leading VAR=VAL tokens are environment variables; once a non-env token
-    // appears, the rest of the prefix belongs to wrapper commands.
-    let i = 0;
-    while (i < before.length && ENV_RE.test(before[i])) {
-        items.push(makeItem('env', before[i]));
-        i++;
-    }
+    // Every VAR=VAL token before %command% becomes an env item — community
+    // strings routinely interleave env vars with wrappers ("gamemoderun
+    // PROTON_NO_ESYNC=1 %command%"); composing them env-first also fixes the
+    // shell semantics. Exception: tokens following `env` belong to it.
     let wrapperParts: string[] = [];
     const flushWrapper = () => {
         if (wrapperParts.length) {
@@ -161,11 +162,18 @@ export function parseLaunchOptions(raw: string): ArgItem[] {
             wrapperParts = [];
         }
     };
-    for (; i < before.length; i++) {
-        if (KNOWN_WRAPPERS.has(before[i]) && wrapperParts.length) flushWrapper();
-        wrapperParts.push(before[i]);
+    for (let i = 0; i < before.length; i++) {
+        const tok = before[i];
+        if (ENV_RE.test(tok) && wrapperParts[0] !== 'env') {
+            items.push(makeItem('env', tok));
+            continue;
+        }
+        if (KNOWN_WRAPPERS.has(tok) && wrapperParts.length) flushWrapper();
+        wrapperParts.push(tok);
     }
     flushWrapper();
+    // env items first, preserving relative order within each group
+    items.sort((a, b) => (a.kind === 'env' ? 0 : 1) - (b.kind === 'env' ? 0 : 1));
 
     // After %command%: a new flag item starts at each -flag/+cvar token; bare
     // tokens attach to the previous item as values (covers "-w 1920").

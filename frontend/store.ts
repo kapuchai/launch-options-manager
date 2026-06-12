@@ -79,24 +79,16 @@ async function doLoadStore(): Promise<Store> {
     return store;
 }
 
-// First-run convenience: a starter profile so the Profiles tab demonstrates
-// the workflow. Created once; deleting it is respected. The seeded flag is
-// set in the same step that pushes the profile, so a flush in between can
-// never persist the flag without the profile.
+// The Default profile is the documented, undeletable fallback — recreate it
+// whenever it's missing (covers stores from before it became protected).
 function seedDefaultProfile(): void {
-    if (store.ui.defaultProfileSeeded || store.profiles.length) {
-        store.ui.defaultProfileSeeded = true;
-        return;
-    }
+    if (store.profiles.some((p) => p.name === 'Default')) return;
     getCapabilities().then((caps) => {
-        if (store.ui.defaultProfileSeeded || store.profiles.length) {
-            store.ui.defaultProfileSeeded = true;
-            return;
-        }
+        if (store.profiles.some((p) => p.name === 'Default')) return;
         const has = (bin: string) => Boolean(caps?.bins?.[bin]);
         const wrapper = has('game-performance') ? 'game-performance' : 'gamemoderun';
         store.ui.defaultProfileSeeded = true;
-        store.profiles.push({
+        store.profiles.unshift({
             name: 'Default',
             items: [
                 // enabled only when the binary actually exists — an enabled
