@@ -5,8 +5,27 @@ local utils = require("utils")
 local http = require("http")
 local json = require("json")
 
-STORE_PATH = fs.parent_path(utils.get_backend_path()) .. "/lom-store.json"
+-- User data lives OUTSIDE the plugin folder: plugin updates replace the
+-- install directory wholesale, which must never take the store with it.
+local data_home = utils.getenv("XDG_DATA_HOME")
+if not data_home or data_home == "" then
+    data_home = (utils.getenv("HOME") or "") .. "/.local/share"
+end
+local DATA_DIR = data_home .. "/launch-options-manager"
+fs.create_directories(DATA_DIR)
+
+STORE_PATH = DATA_DIR .. "/lom-store.json"
 BAK_PATH = STORE_PATH .. ".bak"
+
+-- one-time migration from the old in-plugin location
+local OLD_STORE = fs.parent_path(utils.get_backend_path()) .. "/lom-store.json"
+if not fs.exists(STORE_PATH) and fs.exists(OLD_STORE) then
+    fs.copy(OLD_STORE, STORE_PATH)
+    if fs.exists(OLD_STORE .. ".bak") then
+        fs.copy(OLD_STORE .. ".bak", BAK_PATH)
+    end
+    logger:info("Migrated store to " .. DATA_DIR)
+end
 
 -- All RPC functions return non-empty JSON strings: Millennium's IPC mangles
 -- nil/empty/boolean returns (observed: empty string arrives at the frontend
@@ -37,7 +56,11 @@ function GetStore()
         return content
     end
     if err then
+        -- the file EXISTS but can't be read: report the error rather than
+        -- silently serving the stale backup (a later save would then rotate
+        -- the unreadable-but-intact newest data away)
         logger:error("Failed to open store: " .. err)
+        return '{"__readError":true}'
     end
     local bak, bak_err = read_store_file(BAK_PATH)
     if bak then

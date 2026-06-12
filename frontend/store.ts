@@ -39,15 +39,34 @@ export function loadStore(): Promise<Store> {
 
 // Build a well-formed Store from untrusted parsed JSON: per-entry shape
 // checks so a hand-edited or truncated file can never crash a render.
+const VALID_KINDS = ['env', 'wrapper', 'flag', 'raw'];
+
+function sanitizeItems(items: any[]): ArgItem[] {
+    return items
+        .filter((it: any) => it && typeof it.text === 'string' && VALID_KINDS.includes(it.kind))
+        .map((it: any) => ({
+            ...makeItem(it.kind, it.text, it.enabled !== false),
+            text: it.text, // preserve original whitespace
+            note: typeof it.note === 'string' ? it.note : undefined,
+        }));
+}
+
 function normalizeStore(parsed: any): Store {
     const games: Record<string, GameConfig> = {};
     if (parsed.games && typeof parsed.games === 'object' && !Array.isArray(parsed.games)) {
         for (const [key, cfg] of Object.entries<any>(parsed.games)) {
-            if (cfg && typeof cfg === 'object' && Array.isArray(cfg.items)) games[key] = cfg;
+            if (cfg && typeof cfg === 'object' && Array.isArray(cfg.items)) {
+                games[key] = {
+                    items: sanitizeItems(cfg.items),
+                    lastApplied: String(cfg.lastApplied ?? ''),
+                    updatedAt: Number(cfg.updatedAt ?? 0),
+                };
+            }
         }
     }
     const profiles: Profile[] = (Array.isArray(parsed.profiles) ? parsed.profiles : [])
-        .filter((p: any) => p && typeof p.name === 'string' && Array.isArray(p.items));
+        .filter((p: any) => p && typeof p.name === 'string' && Array.isArray(p.items))
+        .map((p: any) => ({ name: p.name, items: sanitizeItems(p.items) }));
     return {
         version: 1,
         games,
@@ -537,6 +556,7 @@ export async function replaceStoreFromText(raw: string): Promise<{ ok: boolean; 
     loadFailed = false;
     loadPromise = Promise.resolve(store);
     storeGeneration++;
+    seedDefaultProfile();
     const saved = await flushStore();
     return saved ? { ok: true } : { ok: false, reason: 'could not write the restored data to disk' };
 }

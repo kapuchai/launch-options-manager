@@ -1218,8 +1218,8 @@ function InfoTab() {
                 always a baseline to fall back to. Export/Import shares profiles as JSON files.</P>
 
             <H>Data &amp; safety</H>
-            <P>Everything lives in <span style={{ fontFamily: C.mono }}>lom-store.json</span> in the plugin
-                folder (a .bak of the previous generation is kept automatically). Full backups and restores
+            <P>Everything lives in <span style={{ fontFamily: C.mono }}>~/.local/share/launch-options-manager/</span>
+                (a .bak of the previous generation is kept automatically). Full backups and restores
                 are available in the plugin's Millennium settings. Steam itself only ever sees the composed
                 launch-options string — uninstalling the plugin leaves your games exactly as configured.</P>
 
