@@ -1,5 +1,4 @@
 import React, { useEffect, useState } from 'react';
-import { createRoot } from 'react-dom/client';
 import { Field, IconsModule, Millennium, Toggle, definePlugin, findModule, showModal, sleep } from '@steambrew/client';
 import { ManagerWindow } from './manager';
 import { composeLaunchOptions } from './model';
@@ -12,9 +11,6 @@ declare const uiStore: any;
 // plugins run in an isolated context where `window.MainWindowBrowserManager`
 // stays undefined even once the global is reachable by name.
 declare const MainWindowBrowserManager: any;
-
-const WaitForElement = async (sel: string, parent: any = document) =>
-    [...(await Millennium.findElement(parent, sel))][0] as HTMLElement;
 
 const WaitForElementTimeout = async (sel: string, parent: any = document, timeOut = 2000) =>
     [...(await Millennium.findElement(parent, sel, timeOut))][0] as HTMLElement;
@@ -35,7 +31,9 @@ function openManager(triggerPopup: any, appid: number) {
 
 // ── app page: small button next to the ⚙ in the action row ─────────────────
 
-async function injectAppPageButton(popup: any) {
+// Synchronous, idempotent injection — called from a document-wide observer,
+// so it must be cheap and never wait.
+function maybeInjectAppButton(popup: any): void {
     const doc = popup?.m_popup?.document;
     if (!doc) return;
     const existing = doc.querySelector('div.lom-button');
@@ -45,17 +43,22 @@ async function injectAppPageButton(popup: any) {
     }
     if (existing) return;
 
-    const gameSettingsButton = await WaitForElement(
-        `div.${findModule((e: any) => e.InPage).InPage} div.${findModule((e: any) => e.AppButtonsContainer).AppButtonsContainer} > div.${findModule((e: any) => e.MenuButtonContainer).MenuButtonContainer}:not([role="button"])`,
-        doc,
-    );
-    if (gameSettingsButton.parentNode!.querySelector('div.lom-button')) return;
+    let selector: string;
+    try {
+        selector = `div.${findModule((e: any) => e.InPage).InPage} div.${findModule((e: any) => e.AppButtonsContainer).AppButtonsContainer} > div.${findModule((e: any) => e.MenuButtonContainer).MenuButtonContainer}:not([role="button"])`;
+    } catch (e) {
+        console.error('[launch-options-manager] app button class lookup failed', e);
+        return;
+    }
+    const gameSettingsButton = doc.querySelector(selector) as HTMLElement | null;
+    if (!gameSettingsButton) return; // not on an app page right now
 
     const lomButton = gameSettingsButton.cloneNode(true) as HTMLElement;
     lomButton.classList.add('lom-button');
     (lomButton.firstChild as HTMLElement).innerHTML = '⚡';
     lomButton.title = 'Launch Options Manager';
     gameSettingsButton.parentNode!.insertBefore(lomButton, gameSettingsButton.nextSibling);
+    console.error('[launch-options-manager] app page button injected (diagnostic, not an error)');
 
     lomButton.addEventListener('click', () => {
         const appid = uiStore.currentGameListSelection.nAppId;
@@ -63,22 +66,72 @@ async function injectAppPageButton(popup: any) {
     });
 }
 
-// ── properties dialog: compact link on the General/Shortcut page ────────────
+// Steam re-renders the app page header freely (and the navigation-event path
+// has proven unreliable here), so a debounced document observer is the source
+// of truth: whenever the action row exists without our button, inject it.
+function watchAppPage(popup: any): void {
+    const doc = popup?.m_popup?.document;
+    if (!doc?.body || doc.body.dataset.lomWatched) return;
+    doc.body.dataset.lomWatched = '1';
+    let scheduled = false;
+    const observer = new MutationObserver(() => {
+        if (scheduled) return;
+        scheduled = true;
+        setTimeout(() => {
+            scheduled = false;
+            try { maybeInjectAppButton(popup); } catch (e) {
+                console.error('[launch-options-manager] app page inject failed', e);
+            }
+        }, 300);
+    });
+    observer.observe(doc.body, { childList: true, subtree: true });
+    console.error('[launch-options-manager] app page watcher attached (diagnostic, not an error)');
+    maybeInjectAppButton(popup);
+}
 
+// ── properties dialog: icon inside the launch-options field ─────────────────
+
+// Overlaid on the input's right edge — zero layout impact on the dialog (an
+// appended block element made Steam's flex layout squeeze the other rows).
 async function injectPropertiesButton(popup: any, panel: HTMLElement, appid: number) {
     if (panel.querySelector('.lom-props-button')) return;
-    const dialogBody = await WaitForElement('div.DialogBody', panel);
+    const dialogBody = await WaitForElementTimeout('div.DialogBody', panel, 3000);
+    if (!dialogBody || panel.querySelector('.lom-props-button')) return;
+    const doc: Document = popup.m_popup.document;
 
-    const container = popup.m_popup.document.createElement('div');
-    container.classList.add('lom-props-button');
-    container.style.cssText = 'display:flex;justify-content:flex-end;margin-top:4px;';
-    dialogBody.appendChild(container);
-    createRoot(container).render(
-        <a
-            style={{ fontSize: '12px', cursor: 'pointer', opacity: 0.75, textDecoration: 'underline' }}
-            onClick={() => openManager(popup, appid)}
-        >⚡ Launch Options Manager…</a>,
-    );
+    // The launch-options field is the last text input on the General page
+    // (and on the non-Steam shortcut page).
+    const inputs = dialogBody.querySelectorAll('input[type="text"]');
+    const input = inputs[inputs.length - 1] as HTMLInputElement | undefined;
+
+    const button = doc.createElement('button');
+    button.className = 'lom-props-button';
+    button.textContent = '⚡';
+    button.title = 'Open Launch Options Manager';
+    button.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        openManager(popup, appid);
+    });
+    button.addEventListener('mouseenter', () => { button.style.opacity = '1'; });
+    button.addEventListener('mouseleave', () => { button.style.opacity = '0.55'; });
+
+    if (input && input.parentElement) {
+        const holder = input.parentElement as HTMLElement;
+        if (getComputedStyle(holder).position === 'static') holder.style.position = 'relative';
+        input.style.paddingRight = '32px';
+        button.style.cssText =
+            'position:absolute;right:2px;top:50%;transform:translateY(-50%);background:transparent;'
+            + 'border:none;color:inherit;opacity:0.55;cursor:pointer;font-size:14px;padding:2px 7px;line-height:1;';
+        holder.appendChild(button);
+    } else {
+        // fallback: minimal inline link at the end of the dialog body
+        button.style.cssText =
+            'align-self:flex-end;background:transparent;border:none;color:inherit;opacity:0.55;'
+            + 'cursor:pointer;font-size:12px;padding:0;line-height:1.4;text-decoration:underline;';
+        button.textContent = '⚡ Launch Options Manager…';
+        dialogBody.appendChild(button);
+    }
 }
 
 async function watchPropertiesDialog(popup: any) {
@@ -109,23 +162,32 @@ const boundBrowsers = new WeakSet<object>();
 async function OnPopupCreation(popup: any) {
     if (popup.m_strName === 'SP Desktop_uid0') {
         setMainWindowPopup(popup);
+        // Primary: document observer (cannot miss; survives re-renders).
+        watchAppPage(popup);
+        // Secondary: navigation events give an immediate trigger without the
+        // observer debounce, when MainWindowBrowserManager is reachable.
+        // On window re-creation the global may still point at the OLD browser
+        // for a while — only accept one we haven't bound yet, bounded retry.
         let mwbm: any = undefined;
-        while (!mwbm) {
+        for (let i = 0; i < 150 && !mwbm; i++) {
             try {
-                mwbm = MainWindowBrowserManager;
-            } catch {
-                await sleep(200);
-            }
+                const candidate = MainWindowBrowserManager;
+                if (candidate?.m_browser && !boundBrowsers.has(candidate.m_browser)) {
+                    mwbm = candidate;
+                    break;
+                }
+            } catch { /* global not defined yet */ }
+            await sleep(200);
         }
-        if (boundBrowsers.has(mwbm.m_browser)) return;
+        if (!mwbm) return; // the document observer still covers injection
         boundBrowsers.add(mwbm.m_browser);
         mwbm.m_browser.on('finished-request', () => {
             if (mwbm.m_lastLocation.pathname.startsWith('/library/app/')) {
-                injectAppPageButton(getMainWindowPopup() ?? popup).catch((e) =>
-                    console.error('[launch-options-manager] app page inject failed', e));
+                try { maybeInjectAppButton(getMainWindowPopup() ?? popup); } catch (e) {
+                    console.error('[launch-options-manager] app page inject failed', e);
+                }
             }
         });
-        console.log('[launch-options-manager] navigation listener attached');
     } else if (popup.m_strName?.startsWith('PopupWindow_')) {
         watchPropertiesDialog(popup).catch(() => { /* not a game properties dialog */ });
     }

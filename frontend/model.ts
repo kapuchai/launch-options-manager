@@ -14,6 +14,8 @@ export interface ArgItem {
     kind: ArgKind;
     text: string;
     enabled: boolean;
+    // user-authored annotation, never written to Steam
+    note?: string;
 }
 
 export interface GameConfig {
@@ -200,6 +202,18 @@ export function reconcile(stored: ArgItem[] | undefined, lastApplied: string | u
         return stored;
     }
     const parsed = parseLaunchOptions(live);
+    // Out-of-band edit: re-parse the live string, but carry user notes over
+    // to re-parsed items by trimmed-text match (stored text may carry typing
+    // whitespace; parsed text is always trimmed). First note wins on dupes.
+    const notesByText = new Map<string, string>();
+    for (const it of stored) {
+        const key = it.text.trim();
+        if (it.note && !notesByText.has(key)) notesByText.set(key, it.note);
+    }
+    for (const it of parsed) {
+        const note = notesByText.get(it.text.trim());
+        if (note) it.note = note;
+    }
     const liveTexts = new Set(parsed.map((it) => it.text));
     // Token-level containment too: a disabled "-w 1920 -h 1080" re-added
     // outside the plugin parses as two separate items, not one equal text.

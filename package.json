@@ -1,6 +1,6 @@
 {
   "name": "launch-options-manager",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Structured editor for Steam game launch options: toggleable args, presets, profiles and bulk apply.",
   "type": "module",
   "main": "./frontend/index.tsx",

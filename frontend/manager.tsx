@@ -38,9 +38,18 @@ interface Palette {
     red: string;
     yellow: string;
     mono: string;
+    input: string;
+    header: string;
+    accentHover: string;
 }
 
-const FALLBACK: Palette = {
+interface PaletteExtra {
+    input: string;
+    header: string;
+    accentHover: string;
+}
+
+const FALLBACK: Palette & PaletteExtra = {
     bg: '#171d25',
     panel: '#1f2630',
     panelHover: '#252d39',
@@ -52,6 +61,9 @@ const FALLBACK: Palette = {
     red: '#d94126',
     yellow: '#e8a33d',
     mono: '"DejaVu Sans Mono", Consolas, monospace',
+    input: 'rgba(0,0,0,0.35)',
+    header: '#252d39',
+    accentHover: '#3eb1ff',
 };
 
 // Adapt to the active Millennium theme: SpaceTheme (and themes following its
@@ -71,18 +83,24 @@ function readPalette(doc: Document): Palette {
         const themed = triplet('--st-background') !== null || triplet('--st-accent-1') !== null;
         if (!themed) return FALLBACK;
         const bodyColor = getComputedStyle(doc.body).color;
+        // SpaceTheme layering: background (10,10,10) sits behind everything;
+        // visible surfaces are the grays color-1..6. Using the grays — not the
+        // near-black background — matches how the rest of the theme looks.
         return {
-            bg: rgb('--st-background', FALLBACK.bg),
-            panel: rgb('--st-color-4', FALLBACK.panel),
+            bg: rgb('--st-color-1', FALLBACK.bg),
+            panel: rgb('--st-color-2', FALLBACK.panel),
             panelHover: rgb('--st-color-5', FALLBACK.panelHover),
-            border: rgb('--st-color-5', FALLBACK.border),
+            border: rgb('--st-color-6', FALLBACK.border),
             text: bodyColor && bodyColor !== 'rgba(0, 0, 0, 0)' ? bodyColor : FALLBACK.text,
             muted: FALLBACK.muted,
             accent: rgb('--st-accent-1', rgb('--SystemAccentColor-RGB', FALLBACK.accent)),
+            accentHover: rgb('--st-accent-2', rgb('--st-accent-1', FALLBACK.accentHover)),
             green: rgb('--st-green', FALLBACK.green),
             red: rgb('--st-red', FALLBACK.red),
             yellow: rgb('--st-yellow', FALLBACK.yellow),
             mono: FALLBACK.mono,
+            input: rgb('--st-color-3', FALLBACK.input),
+            header: rgb('--st-color-5', FALLBACK.header),
         };
     } catch {
         return FALLBACK;
@@ -107,7 +125,7 @@ function makeStyles(C: Palette): Record<string, React.CSSProperties> {
         },
         rowDisabled: { opacity: 0.55 },
         input: {
-            flex: 1, background: 'rgba(0,0,0,0.35)', color: C.text, border: `1px solid ${C.border}`,
+            flex: 1, background: C.input, color: C.text, border: `1px solid ${C.border}`,
             borderRadius: '2px', padding: '5px 8px', fontFamily: C.mono, fontSize: '12px', outline: 'none', minWidth: 0,
         },
         iconBtn: {
@@ -137,11 +155,55 @@ function makeStyles(C: Palette): Record<string, React.CSSProperties> {
             border: `1px solid ${C.border}`, color: C.muted,
         },
         catHeader: {
-            display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', userSelect: 'none',
-            padding: '7px 10px', background: C.panel, border: `1px solid ${C.border}`,
-            borderRadius: '3px', marginBottom: '4px',
+            display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', userSelect: 'none',
+            padding: '8px 12px', background: C.header, borderLeft: `3px solid ${C.accent}`,
+            borderRadius: '3px', marginBottom: '4px', fontWeight: 600,
+        },
+        presetRow: {
+            display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 8px',
+            background: 'transparent', borderRadius: '3px', marginBottom: '2px', marginLeft: '12px',
+            border: `1px solid ${C.border}`, cursor: 'pointer',
+        },
+        pill: {
+            background: C.panel, color: C.text, border: `1px solid ${C.border}`, cursor: 'pointer',
+            padding: '4px 12px', borderRadius: '12px', fontSize: '12px',
+        },
+        pillActive: {
+            background: C.accent, color: '#fff', border: `1px solid ${C.accent}`,
         },
     };
+}
+
+// :hover and friends can't be expressed inline; a small stylesheet derived
+// from the palette is injected into the pop-out document. Also styles native
+// <select>/<option>, whose dropdown list ignores inline colors.
+function paletteCss(C: Palette): string {
+    return `
+.lom-root button:hover { filter: brightness(1.3); }
+.lom-root .lom-preset-row:hover { background: ${C.panel} !important; }
+.lom-root .lom-cat-header:hover { filter: brightness(1.15); }
+.lom-root select { background: ${C.input}; color: ${C.text}; border: 1px solid ${C.border}; }
+.lom-root select option { background-color: ${C.panel}; color: ${C.text}; }
+.lom-root input::placeholder, .lom-root textarea::placeholder { color: ${C.muted}; }
+.lom-root .lom-drag-over { box-shadow: inset 0 2px 0 ${C.accent}; }
+.lom-root .lom-dragging { opacity: 0.4; }
+.lom-root ::-webkit-scrollbar { width: 8px; }
+.lom-root ::-webkit-scrollbar-thumb { background: ${C.border}; border-radius: 4px; }
+`;
+}
+
+function injectStylesheet(doc: Document, C: Palette): void {
+    try {
+        let style = doc.getElementById('lom-style') as HTMLStyleElement | null;
+        if (!style) {
+            style = doc.createElement('style');
+            style.id = 'lom-style';
+            doc.head.appendChild(style);
+        }
+        style.textContent = paletteCss(C);
+    } catch (e) {
+        console.error('[launch-options-manager] stylesheet injection failed', e);
+    }
 }
 
 const ThemeCtx = createContext<{ C: Palette; S: Record<string, React.CSSProperties> }>({ C: FALLBACK, S: makeStyles(FALLBACK) });
@@ -164,26 +226,78 @@ function MiniToggle(props: { value: boolean; onChange: (v: boolean) => void }) {
 
 interface RowProps {
     item: ArgItem;
-    onChange: (text: string) => void;
-    onToggle: (enabled: boolean) => void;
+    dragging: boolean;
+    dragOver: boolean;
+    canDrop: boolean;
+    onChange: (patch: Partial<ArgItem>, immediate?: boolean) => void;
     onDelete: () => void;
-    onMove: (dir: -1 | 1) => void;
+    onDragStart: () => void;
+    onDragEnd: () => void;
+    onDragOverRow: () => void;
+    onDropOnRow: (dataId: string | null) => void;
 }
 
-function ItemRow({ item, onChange, onToggle, onDelete, onMove }: RowProps) {
+function ItemRow(props: RowProps) {
+    const { item, dragging, dragOver, canDrop } = props;
     const { C, S } = useTheme();
+    const [noteOpen, setNoteOpen] = useState(false);
+    // The row is draggable only while the ⠿ grip is pressed: a permanently
+    // draggable row hijacks mouse text selection inside its inputs (Chromium
+    // starts a row drag instead of a selection).
+    const [dragArmed, setDragArmed] = useState(false);
+    const showNote = noteOpen || Boolean(item.note);
+
     return (
-        <div style={{ ...S.row, ...(item.enabled ? {} : S.rowDisabled) }}>
-            <MiniToggle value={item.enabled} onChange={onToggle} />
-            <input
-                style={S.input}
-                value={item.text}
-                spellCheck={false}
-                onChange={(e) => onChange((e.target as HTMLInputElement).value)}
-            />
-            <button style={S.iconBtn} title="Move up" onClick={() => onMove(-1)}>▲</button>
-            <button style={S.iconBtn} title="Move down" onClick={() => onMove(1)}>▼</button>
-            <button style={{ ...S.iconBtn, color: C.red }} title="Remove" onClick={onDelete}>✕</button>
+        <div
+            className={`${dragging ? 'lom-dragging' : ''} ${dragOver ? 'lom-drag-over' : ''}`}
+            style={{ ...S.row, flexDirection: 'column', alignItems: 'stretch', gap: '4px', ...(item.enabled ? {} : S.rowDisabled) }}
+            draggable={dragArmed}
+            onMouseUp={() => setDragArmed(false)}
+            onDragStart={(e) => { (e as any).dataTransfer?.setData('text/plain', item.id); props.onDragStart(); }}
+            onDragEnd={() => { setDragArmed(false); props.onDragEnd(); }}
+            onDragOver={(e) => {
+                if (!canDrop) return; // no preventDefault → browser shows not-allowed
+                e.preventDefault();
+                props.onDragOverRow();
+            }}
+            onDrop={(e) => { e.preventDefault(); props.onDropOnRow((e as any).dataTransfer?.getData('text/plain') || null); }}
+        >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <span
+                    style={{ color: C.muted, cursor: 'grab', fontSize: '14px', lineHeight: 1, userSelect: 'none' }}
+                    title="Drag to reorder"
+                    onMouseDown={() => setDragArmed(true)}
+                >⠿</span>
+                <MiniToggle value={item.enabled} onChange={(enabled) => props.onChange({ enabled }, true)} />
+                <input
+                    style={S.input}
+                    value={item.text}
+                    spellCheck={false}
+                    draggable={false}
+                    onDragStart={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                    onChange={(e) => props.onChange({ text: (e.target as HTMLInputElement).value })}
+                />
+                <button style={{ ...S.iconBtn, ...(showNote ? { color: C.accent } : {}) }} title={item.note ? 'Edit note' : 'Add a note'}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => setNoteOpen(!noteOpen)}>✎</button>
+                <button style={{ ...S.iconBtn, color: C.red }} title="Remove" onClick={props.onDelete}>✕</button>
+            </div>
+            {showNote && (
+                noteOpen
+                    ? <input
+                        style={{ ...S.input, fontFamily: 'inherit', fontSize: '11px', marginLeft: '60px' }}
+                        placeholder="Note to self (not sent to Steam)…"
+                        value={item.note ?? ''}
+                        autoFocus
+                        draggable={false}
+                        onDragStart={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                        onChange={(e) => props.onChange({ note: (e.target as HTMLInputElement).value })}
+                        onBlur={() => setNoteOpen(false)}
+                        onKeyDown={(e) => { if ((e as any).key === 'Enter') setNoteOpen(false); }}
+                    />
+                    : <div style={{ color: C.muted, fontSize: '11px', marginLeft: '60px', cursor: 'text' }}
+                        onClick={() => setNoteOpen(true)}>{item.note}</div>
+            )}
         </div>
     );
 }
@@ -231,6 +345,10 @@ export function ManagerWindow({ appid }: { appid: number }) {
     // Monotonic apply counter — a superseded verification must not flash its
     // (stale) result over a newer apply's.
     const runSeq = useRef(0);
+    // Last string actually written to Steam: compose-neutral edits (notes,
+    // empty rows) are persisted to the plugin store without a Steam write or
+    // an 'Applying…' flash.
+    const lastPushed = useRef<string | null>(null);
     const gameName = useMemo(() => getGameName(appid), [appid]);
     const { C, S } = theme;
 
@@ -249,6 +367,7 @@ export function ManagerWindow({ appid }: { appid: number }) {
         if (doc) {
             const palette = readPalette(doc);
             setTheme({ C: palette, S: makeStyles(palette) });
+            injectStylesheet(doc, palette);
         }
     }, []);
 
@@ -262,6 +381,7 @@ export function ManagerWindow({ appid }: { appid: number }) {
         getGameItems(appid).then(({ items: loadedItems, liveUnknown, proton: protonFlag }) => {
             setItems(loadedItems);
             setProton(protonFlag);
+            lastPushed.current = composeLaunchOptions(loadedItems);
             if (persistenceBlocked()) {
                 flash('Changes are NOT saved — the plugin store file could not be read', 'red');
             } else if (liveUnknown) {
@@ -282,7 +402,7 @@ export function ManagerWindow({ appid }: { appid: number }) {
                 pendingItems.current = null;
                 const composed = composeLaunchOptions(next);
                 setGameItems(appid, next, composed);
-                setLaunchOptions(appid, composed);
+                if (composed !== lastPushed.current) setLaunchOptions(appid, composed);
             }
             flushStore();
         };
@@ -299,6 +419,11 @@ export function ManagerWindow({ appid }: { appid: number }) {
             const seq = ++runSeq.current;
             const composed = composeLaunchOptions(next);
             setGameItems(appid, next, composed);
+            if (composed === lastPushed.current) {
+                flash('Saved', 'muted', true);
+                return;
+            }
+            lastPushed.current = composed;
             flash('Applying…', 'muted');
             try {
                 const verified = await setAndVerifyLaunchOptions(appid, composed);
@@ -321,6 +446,7 @@ export function ManagerWindow({ appid }: { appid: number }) {
         applyTimer.current = null;
         pendingItems.current = null;
         runSeq.current++;
+        lastPushed.current = composeLaunchOptions(next);
         setItems(next);
     };
 
@@ -342,18 +468,19 @@ export function ManagerWindow({ appid }: { appid: number }) {
 
     const deleteItem = (id: string) => update(items.filter((it) => it.id !== id), true);
 
-    const moveItem = (id: string, dir: -1 | 1) => {
-        const item = items.find((it) => it.id === id);
-        if (!item) return;
-        const siblings = items.filter((it) => it.kind === item.kind);
-        const pos = siblings.indexOf(item);
-        const target = siblings[pos + dir];
-        if (!target) return;
-        const next = items.slice();
-        const i = next.indexOf(item);
-        const j = next.indexOf(target);
-        next[i] = target;
-        next[j] = item;
+    // Drag & drop within a section; cross-kind drops are ignored (order
+    // across kinds is fixed). Dragging downward lands BELOW the target so the
+    // last position is reachable; upward lands above it.
+    const reorderItem = (dragId: string, targetId: string) => {
+        if (dragId === targetId) return;
+        const dragged = items.find((it) => it.id === dragId);
+        const target = items.find((it) => it.id === targetId);
+        if (!dragged || !target || dragged.kind !== target.kind) return;
+        const from = items.indexOf(dragged);
+        const to = items.indexOf(target);
+        const next = items.filter((it) => it.id !== dragId);
+        next.splice(next.indexOf(target) + (from < to ? 1 : 0), 0, dragged);
+        if (next.every((it, i) => it === items[i])) return;
         update(next, true);
     };
 
@@ -401,7 +528,7 @@ export function ManagerWindow({ appid }: { appid: number }) {
                 <div style={S.body}>
                     {tab === 'args' && (
                         <ArgsTab items={items} hasRaw={hasRaw}
-                            onChange={changeItem} onDelete={deleteItem} onMove={moveItem} onAdd={addItem} />
+                            onChange={changeItem} onDelete={deleteItem} onReorder={reorderItem} onAdd={addItem} />
                     )}
                     {tab === 'presets' && (
                         <PresetsTab hasRaw={hasRaw} caps={caps} proton={proton}
@@ -411,7 +538,7 @@ export function ManagerWindow({ appid }: { appid: number }) {
                     {tab === 'profiles' && (
                         <ProfilesTab items={items} flash={flash} hasRaw={hasRaw}
                             onLoad={(profileItems, replace) => {
-                                const copies = profileItems.map((it) => ({ ...makeItem(it.kind, it.text, it.enabled) }));
+                                const copies = profileItems.map((it) => ({ ...makeItem(it.kind, it.text, it.enabled), note: it.note }));
                                 update(replace ? copies : [...items, ...copies], true);
                                 setTab('args');
                             }} />
@@ -447,11 +574,14 @@ function ArgsTab(props: {
     items: ArgItem[]; hasRaw: boolean;
     onChange: (id: string, patch: Partial<ArgItem>, immediate?: boolean) => void;
     onDelete: (id: string) => void;
-    onMove: (id: string, dir: -1 | 1) => void;
+    onReorder: (dragId: string, targetId: string) => void;
     onAdd: (kind: ArgKind, text?: string) => void;
 }) {
-    const { items, hasRaw, onChange, onDelete, onMove, onAdd } = props;
+    const { items, hasRaw, onChange, onDelete, onReorder, onAdd } = props;
     const { C, S } = useTheme();
+    const [dragId, setDragId] = useState<string | null>(null);
+    const [overId, setOverId] = useState<string | null>(null);
+    const dragKind = dragId ? items.find((it) => it.id === dragId)?.kind ?? null : null;
 
     if (hasRaw) {
         const raw = items.find((it) => it.kind === 'raw')!;
@@ -489,10 +619,22 @@ function ArgsTab(props: {
                         <div style={S.sectionTitle}>{sec.title} <span style={{ opacity: 0.6 }}>— {sec.hint}</span></div>
                         {sectionItems.map((it) => (
                             <ItemRow key={it.id} item={it}
-                                onChange={(text) => onChange(it.id, { text })}
-                                onToggle={(enabled) => onChange(it.id, { enabled }, true)}
+                                dragging={dragId === it.id}
+                                dragOver={overId === it.id && dragId !== null && dragId !== it.id}
+                                canDrop={dragId === null || dragKind === sec.kind}
+                                onChange={(patch, immediate) => onChange(it.id, patch, immediate)}
                                 onDelete={() => onDelete(it.id)}
-                                onMove={(dir) => onMove(it.id, dir)} />
+                                onDragStart={() => setDragId(it.id)}
+                                onDragEnd={() => { setDragId(null); setOverId(null); }}
+                                onDragOverRow={() => setOverId(it.id)}
+                                onDropOnRow={(dataId) => {
+                                    // dataTransfer payload must corroborate our
+                                    // state — guards against stale dragIds from
+                                    // cancelled selection-drags
+                                    if (dragId && dataId === dragId) onReorder(dragId, it.id);
+                                    setDragId(null);
+                                    setOverId(null);
+                                }} />
                         ))}
                         <button style={S.addBtn} onClick={() => onAdd(sec.kind)}>+ add (e.g. {sec.placeholder})</button>
                     </div>
@@ -525,6 +667,7 @@ function PresetsTab(props: {
     const { C, S } = useTheme();
     const [filter, setFilter] = useState('');
     const [openCats, setOpenCats] = useState<string[]>(() => getUISettings().openCategories);
+    const [expandedPreset, setExpandedPreset] = useState<string | null>(null);
 
     if (hasRaw) {
         return (
@@ -562,29 +705,47 @@ function PresetsTab(props: {
                 const catPresets = visible.filter((p) => p.category === cat);
                 const open = filtering || openCats.includes(cat);
                 return (
-                    <div key={cat} style={{ marginBottom: '8px' }}>
-                        <div style={S.catHeader} onClick={() => !filtering && toggleCat(cat)}>
-                            <span style={{ fontSize: '10px', color: C.muted }}>{open ? '▾' : '▸'}</span>
-                            <span style={{ fontWeight: 600 }}>{cat}</span>
-                            <span style={{ color: C.muted, fontSize: '11px', marginLeft: 'auto' }}>{catPresets.length}</span>
+                    <div key={cat} style={{ marginBottom: '10px' }}>
+                        <div className="lom-cat-header" style={S.catHeader} onClick={() => !filtering && toggleCat(cat)}>
+                            <span style={{ fontSize: '11px', color: C.accent }}>{open ? '▾' : '▸'}</span>
+                            <span style={{ textTransform: 'uppercase', letterSpacing: '0.06em', fontSize: '12px' }}>{cat}</span>
+                            <span style={{ color: C.muted, fontSize: '11px', marginLeft: 'auto', fontWeight: 400 }}>{catPresets.length} presets</span>
                         </div>
                         {open && catPresets.map((p) => {
                             const exact = addedExact.has(presetExactKey(p.kind, p.text));
                             const similar = !exact && addedSignatures.has(presetSignature(p.kind, p.text));
                             const issue = presetIssue(p, caps, proton);
+                            const expanded = expandedPreset === p.text;
                             return (
-                                <div key={p.text} style={{ ...S.row, ...(issue ? { opacity: 0.6 } : {}) }}>
-                                    <div style={{ flex: 1, minWidth: 0 }}>
-                                        <div style={{ fontFamily: C.mono, fontSize: '12px', display: 'flex', gap: '8px', alignItems: 'center' }}>
-                                            {p.text}
-                                            {issue && <span style={{ ...S.badge, color: C.yellow, borderColor: C.yellow }}>{issue}</span>}
-                                            {similar && <span style={S.badge}>similar item present</span>}
+                                <div key={p.text} className="lom-preset-row" style={{ ...S.presetRow, flexDirection: 'column', alignItems: 'stretch', gap: '4px', ...(issue ? { opacity: 0.65 } : {}) }}
+                                    onClick={() => setExpandedPreset(expanded ? null : p.text)}>
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                        <span style={{ fontSize: '9px', color: C.muted, flexShrink: 0 }}>{expanded ? '▾' : '▸'}</span>
+                                        <div style={{ flex: 1, minWidth: 0 }}>
+                                            <div style={{ fontFamily: C.mono, fontSize: '12px', display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+                                                {p.text}
+                                                {issue && <span style={{ ...S.badge, color: C.yellow, borderColor: C.yellow }}>{issue}</span>}
+                                                {similar && <span style={S.badge}>similar item present</span>}
+                                            </div>
+                                            {!expanded && <div style={{ color: C.muted, fontSize: '11px', marginTop: '2px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.description}</div>}
                                         </div>
-                                        <div style={{ color: C.muted, fontSize: '11px', marginTop: '2px' }}>{p.description}</div>
+                                        {exact
+                                            ? <span style={{ ...S.badge, color: C.green, borderColor: C.green, flexShrink: 0 }}>✓ added</span>
+                                            : <button style={{ ...S.smallBtn, flexShrink: 0 }}
+                                                onClick={(e) => { e.stopPropagation(); onAdd(p); }}>{similar ? '+ Add variant' : '+ Add'}</button>}
                                     </div>
-                                    {exact
-                                        ? <span style={{ ...S.badge, color: C.green, borderColor: C.green }}>✓ added</span>
-                                        : <button style={S.smallBtn} onClick={() => onAdd(p)}>{similar ? '+ Add variant' : '+ Add'}</button>}
+                                    {expanded && (
+                                        <div style={{ marginLeft: '17px', paddingBottom: '2px' }} onClick={(e) => e.stopPropagation()}>
+                                            <div style={{ fontSize: '12px', lineHeight: 1.55 }}>{p.description}</div>
+                                            {p.details && <div style={{ color: C.muted, fontSize: '12px', lineHeight: 1.55, marginTop: '4px' }}>{p.details}</div>}
+                                            <div style={{ display: 'flex', gap: '6px', marginTop: '6px' }}>
+                                                <span style={S.badge}>{p.kind === 'env' ? 'environment variable' : p.kind === 'wrapper' ? 'wrapper command' : 'game argument'}</span>
+                                                {p.bin && <span style={S.badge}>needs: {p.bin}</span>}
+                                                {p.proton && <span style={S.badge}>Proton games</span>}
+                                                {p.gpu && <span style={S.badge}>{p.gpu === 'mesa' ? 'Mesa GPUs' : `${p.gpu.toUpperCase()} GPUs`}</span>}
+                                            </div>
+                                        </div>
+                                    )}
                                 </div>
                             );
                         })}
@@ -675,6 +836,8 @@ function BulkTab(props: {
     const [profileName, setProfileName] = useState('');
     const [filter, setFilter] = useState('');
     const [selected, setSelected] = useState<Set<number>>(new Set());
+    // Which pill made the current selection; clicking it again clears it.
+    const [activeSource, setActiveSource] = useState<string | null>(null);
     const games = useMemo(() => getAllGames(), []);
     const collections = useMemo(() => getUserCollections(), []);
     const profiles = getProfiles();
@@ -687,9 +850,19 @@ function BulkTab(props: {
         if (next.has(appid)) next.delete(appid);
         else next.add(appid);
         setSelected(next);
+        // manual edits mean the selection no longer equals the pill's set
+        setActiveSource(null);
     };
 
-    const selectSet = (appids: number[]) => setSelected(new Set(appids));
+    const togglePill = (id: string, appids: number[]) => {
+        if (activeSource === id) {
+            setSelected(new Set());
+            setActiveSource(null);
+        } else {
+            setSelected(new Set(appids));
+            setActiveSource(id);
+        }
+    };
 
     const apply = () => {
         const profile = profiles.find((p) => p.name === profileName);
@@ -697,7 +870,7 @@ function BulkTab(props: {
         const composed = composeLaunchOptions(profile.items);
         let ok = 0;
         for (const appid of selected) {
-            const copies = profile.items.map((it) => makeItem(it.kind, it.text, it.enabled));
+            const copies = profile.items.map((it) => ({ ...makeItem(it.kind, it.text, it.enabled), note: it.note }));
             if (setLaunchOptions(appid, composed)) {
                 setGameItems(appid, copies, composed);
                 ok++;
@@ -709,6 +882,7 @@ function BulkTab(props: {
         flushStore();
         flash(`Profile applied to ${ok} game${ok === 1 ? '' : 's'}`, 'green', true);
         setSelected(new Set());
+        setActiveSource(null);
     };
 
     return (
@@ -731,13 +905,19 @@ function BulkTab(props: {
                     Games <span style={{ opacity: 0.6 }}>— {selected.size} selected; replaces their launch options</span>
                 </div>
                 <div style={{ display: 'flex', gap: '6px', marginBottom: '8px', flexWrap: 'wrap' }}>
-                    <button style={S.smallBtn} onClick={() => selectSet(games.map((g) => g.appid))}>All games</button>
-                    <button style={S.smallBtn} onClick={() => selectSet(games.filter((g) => g.installed).map((g) => g.appid))}>All installed</button>
+                    <button style={{ ...S.pill, ...(activeSource === 'all' ? S.pillActive : {}) }}
+                        onClick={() => togglePill('all', games.map((g) => g.appid))}>All games</button>
+                    <button style={{ ...S.pill, ...(activeSource === 'installed' ? S.pillActive : {}) }}
+                        onClick={() => togglePill('installed', games.filter((g) => g.installed).map((g) => g.appid))}>All installed</button>
                     {collections.map((c) => (
-                        <button key={c.id} style={S.smallBtn} title={`Select the "${c.name}" collection (${c.appids.length} games)`}
-                            onClick={() => selectSet(c.appids)}>{c.name}</button>
+                        <button key={c.id} style={{ ...S.pill, ...(activeSource === c.id ? S.pillActive : {}) }}
+                            title={`Select the "${c.name}" collection (${c.appids.length} games); click again to clear`}
+                            onClick={() => togglePill(c.id, c.appids)}>{c.name}</button>
                     ))}
-                    <button style={{ ...S.smallBtn, color: C.muted }} onClick={() => setSelected(new Set())}>Clear</button>
+                    {selected.size > 0 && (
+                        <button style={{ ...S.pill, color: C.muted }}
+                            onClick={() => { setSelected(new Set()); setActiveSource(null); }}>✕ Clear</button>
+                    )}
                 </div>
                 <input
                     style={{ ...S.input, width: '100%', boxSizing: 'border-box', marginBottom: '8px' }}
